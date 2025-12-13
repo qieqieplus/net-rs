@@ -1,0 +1,22 @@
+[package]
+name = "net-rs"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+rdma = ["dep:sideway", "dep:crossbeam", "dep:dashmap"]
+
+[dependencies]
+tokio = { version = "1.36", features = ["full"] }
+bytes = "1.5"
+thiserror = "1.0"
+async-trait = "0.1"
+tracing = "0.1"
+futures = "0.3"
+sideway = { version = "0.4", optional = true }
+crossbeam = { version = "0.8", optional = true }
+dashmap = { version = "5.5", optional = true }
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
