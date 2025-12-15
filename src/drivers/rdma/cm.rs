@@ -22,8 +22,9 @@ pub struct RdmaListener {
 
 impl RdmaListener {
     pub fn local_addr(&self) -> SocketAddr {
-        // sideway doesn't expose local addr getter; this is best-effort via caller knowledge.
-        // Keep as placeholder for future API.
+        // TODO: sideway v0.4.0 doesn't expose rdma_get_local_addr wrapper.
+        // Returning placeholder until upstream support is added.
+        // See: https://man7.org/linux/man-pages/man3/rdma_get_local_addr.3.html
         SocketAddr::from(([0, 0, 0, 0], 0))
     }
 
@@ -202,8 +203,10 @@ fn blocking_accept(
     max_send_wr: u32,
     max_recv_wr: u32,
 ) -> io::Result<RdmaTransport> {
-    let mut pending: Option<(Arc<Identifier>, Arc<RdmaContext>, GenericCompletionQueue, GenericQueuePair)> = None;
-    let mut pending_ptr: Option<usize> = None;
+    use std::collections::HashMap;
+    
+    // Track multiple pending connections by their Arc pointer address
+    let mut pending: HashMap<usize, (Arc<Identifier>, Arc<RdmaContext>, GenericCompletionQueue, GenericQueuePair)> = HashMap::new();
 
     loop {
         let event = event_channel
@@ -219,6 +222,8 @@ fn blocking_accept(
                 let dev_ctx = new_id
                     .get_device_context()
                     .ok_or_else(|| io::Error::other("no device context for connect request"))?;
+                // TODO: For production, consider sharing RdmaContext (and its PD) across
+                // connections to the same device for better memory region sharing.
                 let rdma_ctx = RdmaContext::from_device_context(dev_ctx)?;
 
                 let cq: GenericCompletionQueue = rdma_ctx
@@ -244,28 +249,30 @@ fn blocking_accept(
                 new_id.accept(param)
                     .map_err(|e| io::Error::other(e.to_string()))?;
 
-                pending_ptr = Some(Arc::as_ptr(&new_id) as usize);
-                pending = Some((new_id, rdma_ctx, cq, qp));
+                let id_ptr = Arc::as_ptr(&new_id) as usize;
+                pending.insert(id_ptr, (new_id, rdma_ctx, cq, qp));
             }
             EventType::Established => {
-                if let Some(ptr) = pending_ptr {
-                    if let Some(cm_id) = event.cm_id() {
-                        if Arc::as_ptr(&cm_id) as usize != ptr {
-                            continue;
-                        }
-                    }
+                let cm_id = event
+                    .cm_id()
+                    .ok_or_else(|| io::Error::other("established event without cm_id"))?;
+                
+                let id_ptr = Arc::as_ptr(&cm_id) as usize;
+                
+                if let Some((cm_id, rdma_ctx, cq, qp)) = pending.remove(&id_ptr) {
+                    return Ok(build_connected_transport(cm_id, rdma_ctx, cq, qp));
                 }
-
-                let (cm_id, rdma_ctx, cq, qp) = pending
-                    .take()
-                    .ok_or_else(|| io::Error::other("established without pending accept"))?;
-                return Ok(build_connected_transport(cm_id, rdma_ctx, cq, qp));
+                // Ignore Established for unknown connections (shouldn't happen)
             }
-            EventType::Disconnected => {
-                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "rdma cm disconnected"));
+            EventType::Disconnected | EventType::Rejected => {
+                // Clean up any matching pending connection
+                if let Some(cm_id) = event.cm_id() {
+                    let id_ptr = Arc::as_ptr(&cm_id) as usize;
+                    pending.remove(&id_ptr);
+                }
             }
             _ => {
-                // ignore
+                // ignore other events
                 let _ = timeout;
             }
         }
