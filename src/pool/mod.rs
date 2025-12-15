@@ -92,6 +92,11 @@ where
         let pool = self.pool.read().await;
         pool.len()
     }
+
+    /// Check if the pool is empty.
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
 }
 
 pub mod manager;

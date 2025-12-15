@@ -24,7 +24,7 @@ impl BufferPool for RdmaBufferPool {
 
 pub struct RdmaMr {
     pub mr: Arc<MemoryRegion>,
-    pub buf: BytesMut,
+    buf: BytesMut,
 }
 
 impl RdmaMr {
@@ -47,5 +47,17 @@ impl RdmaMr {
 
     pub fn rkey(&self) -> u32 {
         self.mr.rkey()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
+    pub fn into_inner(self) -> BytesMut {
+        self.buf
     }
 }

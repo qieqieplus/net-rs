@@ -66,10 +66,11 @@ where
                     sleep(backoff).await;
                 }
                 Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("Failed to connect after {} attempts: {}", attempts + 1, e),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "Failed to connect after {} attempts: {}",
+                        attempts + 1,
+                        e
+                    )));
                 }
             }
         }

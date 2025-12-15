@@ -7,12 +7,9 @@ use std::sync::Arc;
 
 /// A simple slab allocator backed by a set of pre-registered fixed-size chunks.
 ///
-/// Each chunk owns its memory (a boxed slice) and is registered exactly once.
+/// Each size class has a single contiguous memory region (MR) that is sliced into chunks.
 /// Allocation is lock-free via `SegQueue`. When a chunk is dropped, it is
 /// automatically returned to its originating slab.
-///
-/// Note: This is intentionally conservative and avoids borrowing lifetimes so we
-/// can hand out pool-backed `Bytes` using `Bytes::from_owner`.
 pub struct SlabAllocator {
     enabled: bool,
     classes: Vec<SizeClass>,
@@ -20,16 +17,18 @@ pub struct SlabAllocator {
 
 struct SizeClass {
     chunk_size: usize,
-    slots: Box<[ChunkSlot]>,
+    base_ptr: usize,
+    mr: Arc<MemoryRegion>,
+    // The backing memory must be kept alive.
+    // We use a Box<[u8]> but we need to access it mutably from multiple threads
+    // (disjoint chunks). We use `UnsafeCell` semantics effectively by holding the raw pointer
+    // and ensuring exclusive access via the `free` queue.
+    _backing_mem: Box<[u8]>,
     free: SegQueue<usize>,
 }
 
-struct ChunkSlot {
-    buf: Box<[u8]>,
-    mr: Arc<MemoryRegion>,
-    lkey: u32,
-    rkey: u32,
-}
+unsafe impl Send for SizeClass {}
+unsafe impl Sync for SizeClass {}
 
 impl SlabAllocator {
     /// Build a slab allocator from `(chunk_size, count)` size classes.
@@ -40,27 +39,31 @@ impl SlabAllocator {
         let access = AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead;
 
         for &(chunk_size, count) in classes {
-            let mut slots: Vec<ChunkSlot> = Vec::with_capacity(count);
-            let free = SegQueue::new();
+            // Allocate one large buffer for the entire class
+            let total_size = chunk_size.checked_mul(count).ok_or_else(|| {
+                io::Error::other("slab size overflow")
+            })?;
 
+            // Initialize with zeros
+            let mut backing_mem = vec![0u8; total_size].into_boxed_slice();
+
+            // Register the entire region
+            let mr = unsafe {
+                pd.reg_mr(backing_mem.as_mut_ptr() as usize, total_size, access)
+                    .map_err(|e| io::Error::other(e.to_string()))?
+            };
+            // pd.reg_mr returns Arc<MemoryRegion>
+
+            let free = SegQueue::new();
             for idx in 0..count {
-                let buf = vec![0u8; chunk_size].into_boxed_slice();
-                let mr: Arc<MemoryRegion> = unsafe {
-                    pd.reg_mr(buf.as_ptr() as usize, buf.len(), access)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
-                };
-                slots.push(ChunkSlot {
-                    lkey: mr.lkey(),
-                    rkey: mr.rkey(),
-                    mr,
-                    buf,
-                });
                 free.push(idx);
             }
 
             out_classes.push(SizeClass {
                 chunk_size,
-                slots: slots.into_boxed_slice(),
+                base_ptr: backing_mem.as_ptr() as usize,
+                _backing_mem: backing_mem,
+                mr,
                 free,
             });
         }
@@ -111,6 +114,7 @@ impl SlabAllocator {
             .iter()
             .enumerate()
             .find(|(_, c)| c.chunk_size >= size)?;
+
         let idx = class.free.pop()?;
         Some(SlabChunk {
             slab: Arc::clone(self),
@@ -142,16 +146,18 @@ impl SlabChunk {
     }
 
     pub fn lkey(&self) -> u32 {
-        self.slab.classes[self.class_idx].slots[self.idx].lkey
+        self.slab.classes[self.class_idx].mr.lkey()
     }
 
     #[allow(dead_code)]
     pub fn rkey(&self) -> u32 {
-        self.slab.classes[self.class_idx].slots[self.idx].rkey
+        self.slab.classes[self.class_idx].mr.rkey()
     }
 
     pub fn as_ptr(&self) -> *const u8 {
-        self.slab.classes[self.class_idx].slots[self.idx].buf.as_ptr()
+        let class = &self.slab.classes[self.class_idx];
+        let offset = self.idx * class.chunk_size;
+        (class.base_ptr + offset) as *const u8
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
@@ -160,7 +166,7 @@ impl SlabChunk {
 
     /// # Safety
     /// This is safe because `SlabChunk` is not `Clone`; the caller holds unique
-    /// ownership of the chunk lease, so mutable access is exclusive.
+    /// ownership of the chunk lease, so mutable access is exclusive (managed by SegQueue).
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         let ptr = self.as_mut_ptr();
         let len = self.capacity();
@@ -173,8 +179,9 @@ impl SlabChunk {
         unsafe { std::slice::from_raw_parts(ptr, len) }
     }
 
+    // Used by tests or internals
     pub fn as_slot_mr(&self) -> Arc<MemoryRegion> {
-        Arc::clone(&self.slab.classes[self.class_idx].slots[self.idx].mr)
+        Arc::clone(&self.slab.classes[self.class_idx].mr)
     }
 }
 
@@ -183,5 +190,3 @@ impl Drop for SlabChunk {
         self.slab.release(self.class_idx, self.idx);
     }
 }
-
-
