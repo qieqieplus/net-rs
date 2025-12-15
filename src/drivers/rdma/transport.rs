@@ -1,4 +1,4 @@
-use crate::transport::{Transport, BufferPool};
+use crate::transport::{framing, Transport, BufferPool};
 use crate::drivers::rdma::context::RdmaContext;
 use crate::drivers::rdma::buffer::{RdmaBufferPool, RdmaMr};
 use crate::drivers::rdma::poller::{Completion, CompletionEvent, RdmaPoller};
@@ -22,7 +22,6 @@ use tokio::sync::{mpsc, Mutex, OnceCell};
 use sideway::rdmacm::communication_manager::Identifier;
 use tracing::{debug, warn};
 
-const DEFAULT_MAX_RECV_BYTES: usize = 1024 * 1024; // 1 MiB payload max, plus 4-byte length header
 const DEFAULT_RECV_DEPTH: usize = 512;
 
 #[allow(dead_code)]
@@ -130,7 +129,7 @@ impl RdmaTransport {
             qp: Arc::new(Mutex::new(GenericQueuePair::Basic(qp))),
             cq,
             next_wr_id: Arc::new(AtomicU64::new(1)),
-            max_recv_bytes: DEFAULT_MAX_RECV_BYTES,
+            max_recv_bytes: framing::DEFAULT_MAX_MESSAGE_SIZE,
             _cm_id: None,
 
             started: OnceCell::new(),
@@ -153,7 +152,7 @@ impl RdmaTransport {
             qp: Arc::new(Mutex::new(qp)),
             cq,
             next_wr_id: Arc::new(AtomicU64::new(1)),
-            max_recv_bytes: DEFAULT_MAX_RECV_BYTES,
+            max_recv_bytes: framing::DEFAULT_MAX_MESSAGE_SIZE,
             context,
             _cm_id: Some(cm_id),
 
@@ -174,7 +173,7 @@ impl RdmaTransport {
     }
 
     fn recv_buf_len(&self) -> usize {
-        4 + self.max_recv_bytes
+        framing::HEADER_LEN + self.max_recv_bytes
     }
 
     async fn ensure_started(&self) -> io::Result<()> {
@@ -281,17 +280,17 @@ impl RdmaTransport {
                     warn!("unexpected recv completion opcode={:?} wr_id={}", c.opcode, wr_id);
                 } else {
                     let received = c.byte_len as usize;
-                    if received < 4 {
+                    if received < framing::HEADER_LEN {
                         warn!("RDMA recv too short: {} bytes", received);
                     } else {
                         match posted {
                             PostedRecvBuf::Slab(chunk) => {
                                 let frame = &chunk.as_slice()[..received.min(recv_len)];
                                 let msg_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
-                                if msg_len <= frame.len().saturating_sub(4) {
+                                if msg_len <= frame.len().saturating_sub(framing::HEADER_LEN) {
                                     recv_manager.push(Bytes::from_owner(SlabPayloadOwner {
                                         chunk,
-                                        offset: 4,
+                                        offset: framing::HEADER_LEN,
                                         len: msg_len,
                                     }));
                                 } else {
@@ -303,8 +302,8 @@ impl RdmaTransport {
                                 drop(_mr);
                                 buf.truncate(received.min(recv_len));
                                 let msg_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-                                if msg_len <= buf.len().saturating_sub(4) {
-                                    let mut payload = buf.split_off(4);
+                                if msg_len <= buf.len().saturating_sub(framing::HEADER_LEN) {
+                                    let mut payload = buf.split_off(framing::HEADER_LEN);
                                     payload.truncate(msg_len);
                                     recv_manager.push(payload.freeze());
                                 } else {
@@ -368,12 +367,12 @@ impl Transport for RdmaTransport {
         let wr_id = self.alloc_wr_id();
 
         // Frame like TCP transport: u32 length prefix (big endian) + payload.
-        let total_len = 4 + buf.len();
+        let total_len = framing::HEADER_LEN + buf.len();
 
         let (lkey, addr, len, keepalive) = if let Some(mut chunk) = self.context.slab.alloc(total_len) {
             let slice = chunk.as_mut_slice();
-            slice[0..4].copy_from_slice(&(buf.len() as u32).to_be_bytes());
-            slice[4..4 + buf.len()].copy_from_slice(buf.as_ref());
+            slice[0..framing::HEADER_LEN].copy_from_slice(&(buf.len() as u32).to_be_bytes());
+            slice[framing::HEADER_LEN..framing::HEADER_LEN + buf.len()].copy_from_slice(buf.as_ref());
             (chunk.lkey(), chunk.as_ptr() as u64, total_len as u32, SendKeepalive::Slab(chunk))
         } else {
             let mut framed = BytesMut::with_capacity(total_len);

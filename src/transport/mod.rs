@@ -2,6 +2,8 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use std::io;
 
+pub mod framing;
+
 /// Abstract factory for allocating buffers.
 /// 
 /// In TCP, this just allocates heap memory.

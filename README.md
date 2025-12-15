@@ -6,7 +6,7 @@ A generic, high-performance async networking library for Rust, designed to suppo
 
 - **Unified Async Transport**: `Transport` trait for abstracting over TCP and RDMA.
 - **Buffer Management**: `BufferPool` trait for efficient memory management (supporting RDMA registered memory).
-- **TCP Driver**: Tokio-based implementation with length-delimited framing.
+- **TCP Driver**: Tokio-based implementation with length-delimited framing and max message size enforcement.
 - **RDMA Driver**: High-performance implementation using the `sideway` crate.
   - **Zero-Copy Memory**: Slab allocator with pre-registered memory regions to eliminate registration overhead.
   - **Batched Receives**: Maintained depth of 512 pre-posted receive buffers to prevent RNR errors.
@@ -86,7 +86,7 @@ cargo run --example rdma_echo_client --features rdma -- 192.168.1.10:18515
 ## Architecture
 
 - **`transport`**: Core traits (`Transport`, `BufferPool`) and connection logic.
-- **`drivers/tcp`**: Standard socket-based implementation.
+- **`drivers/tcp`**: Standard socket-based implementation with 4-byte length prefix framing.
 - **`drivers/rdma`**:
   - `context.rs`: Device context and Protection Domain management.
   - `slab_allocator.rs`: Fixed-size slab allocator for zero-copy memory management.
