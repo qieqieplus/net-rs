@@ -4,7 +4,10 @@ pub mod transport;
 pub mod poller;
 pub mod cm;
 pub mod slab_allocator;
-pub mod recv_pool;
+pub mod remote_buf;
+
+pub use remote_buf::RemoteBuf;
+pub use transport::{RdmaTransport, TransportConfig};
 
 use sideway::ibverbs::device::{DeviceList, DeviceInfo};
 

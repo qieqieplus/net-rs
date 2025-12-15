@@ -22,8 +22,9 @@ pub struct RdmaListener {
 
 impl RdmaListener {
     pub fn local_addr(&self) -> SocketAddr {
-        // sideway doesn't expose local addr getter; this is best-effort via caller knowledge.
-        // Keep as placeholder for future API.
+        // TODO: sideway v0.4.0 doesn't expose rdma_get_local_addr wrapper.
+        // Returning placeholder until upstream support is added.
+        // See: https://man7.org/linux/man-pages/man3/rdma_get_local_addr.3.html
         SocketAddr::from(([0, 0, 0, 0], 0))
     }
 
@@ -37,21 +38,21 @@ impl RdmaListener {
 
         tokio::task::spawn_blocking(move || blocking_accept(event_channel, timeout, max_send_wr, max_recv_wr))
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("join error: {e}")))?
+            .map_err(|e| io::Error::other(format!("join error: {e}")))?
     }
 }
 
 pub async fn listen(bind_addr: SocketAddr, backlog: i32) -> io::Result<RdmaListener> {
     let event_channel = EventChannel::new()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     let id = event_channel
         .create_id(PortSpace::Tcp)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     id.bind_addr(bind_addr)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     id.listen(backlog)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     Ok(RdmaListener {
         event_channel,
@@ -65,15 +66,15 @@ pub async fn listen(bind_addr: SocketAddr, backlog: i32) -> io::Result<RdmaListe
 
 pub async fn connect(dst_addr: SocketAddr, timeout: Duration) -> io::Result<RdmaTransport> {
     let event_channel = EventChannel::new()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     let id = event_channel
         .create_id(PortSpace::Tcp)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     let ec = event_channel.clone();
     tokio::task::spawn_blocking(move || blocking_connect(ec, id, dst_addr, timeout))
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("join error: {e}")))?
+        .map_err(|e| io::Error::other(format!("join error: {e}")))?
 }
 
 fn build_connected_transport(
@@ -103,7 +104,7 @@ fn build_qp(
 
     let qp = qp_builder
         .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(GenericQueuePair::Basic(qp))
 }
 
@@ -114,24 +115,24 @@ fn blocking_connect(
     timeout: Duration,
 ) -> io::Result<RdmaTransport> {
     id.resolve_addr(None, dst_addr, timeout)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     let mut resources: Option<(Arc<RdmaContext>, GenericCompletionQueue, GenericQueuePair)> = None;
 
     loop {
         let event = event_channel
             .get_cm_event()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         match event.event_type() {
             EventType::AddressResolved => {
                 id.resolve_route(timeout)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
             }
             EventType::RouteResolved => {
                 let dev_ctx = id
                     .get_device_context()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no device context after route resolved"))?;
+                    .ok_or_else(|| io::Error::other("no device context after route resolved"))?;
                 let rdma_ctx = RdmaContext::from_device_context(dev_ctx)?;
 
                 let cq: GenericCompletionQueue = rdma_ctx
@@ -139,42 +140,42 @@ fn blocking_connect(
                     .create_cq_builder()
                     .setup_cqe(1024)
                     .build()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                    .map_err(|e| io::Error::other(e.to_string()))?
                     .into();
 
                 let mut qp = build_qp(&rdma_ctx, &cq, 512, 512)?;
                 let attr = id
                     .get_qp_attr(QueuePairState::Init)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
                 qp.modify(&attr)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
 
                 let mut param = ConnectionParameter::new();
                 param.setup_qp_number(qp.qp_number());
                 id.connect(param)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
 
                 resources = Some((rdma_ctx, cq, qp));
             }
             EventType::ConnectResponse => {
                 let (rdma_ctx, _cq, ref mut qp) = resources
                     .as_mut()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "connect response before resources"))?;
+                    .ok_or_else(|| io::Error::other("connect response before resources"))?;
 
                 let attr = id
                     .get_qp_attr(QueuePairState::ReadyToReceive)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
                 qp.modify(&attr)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
 
                 let attr = id
                     .get_qp_attr(QueuePairState::ReadyToSend)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
                 qp.modify(&attr)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
 
                 id.establish()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
 
                 // keep rdma_ctx alive; actual return happens on Established
                 let _ = rdma_ctx;
@@ -182,14 +183,14 @@ fn blocking_connect(
             EventType::Established => {
                 let (rdma_ctx, cq, qp) = resources
                     .take()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "established before resources"))?;
+                    .ok_or_else(|| io::Error::other("established before resources"))?;
                 return Ok(build_connected_transport(id.clone(), rdma_ctx, cq, qp));
             }
             EventType::ConnectError | EventType::Rejected | EventType::Unreachable => {
                 return Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("rdma cm connect failed: {:?}", event.event_type())));
             }
             EventType::AddressError | EventType::RouteError => {
-                return Err(io::Error::new(io::ErrorKind::Other, format!("rdma cm resolve failed: {:?}", event.event_type())));
+                return Err(io::Error::other(format!("rdma cm resolve failed: {:?}", event.event_type())));
             }
             _ => {}
         }
@@ -202,23 +203,27 @@ fn blocking_accept(
     max_send_wr: u32,
     max_recv_wr: u32,
 ) -> io::Result<RdmaTransport> {
-    let mut pending: Option<(Arc<Identifier>, Arc<RdmaContext>, GenericCompletionQueue, GenericQueuePair)> = None;
-    let mut pending_ptr: Option<usize> = None;
+    use std::collections::HashMap;
+    
+    // Track multiple pending connections by their Arc pointer address
+    let mut pending: HashMap<usize, (Arc<Identifier>, Arc<RdmaContext>, GenericCompletionQueue, GenericQueuePair)> = HashMap::new();
 
     loop {
         let event = event_channel
             .get_cm_event()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         match event.event_type() {
             EventType::ConnectRequest => {
                 let new_id = event
                     .cm_id()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "connect request without cm_id"))?;
+                    .ok_or_else(|| io::Error::other("connect request without cm_id"))?;
 
                 let dev_ctx = new_id
                     .get_device_context()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no device context for connect request"))?;
+                    .ok_or_else(|| io::Error::other("no device context for connect request"))?;
+                // TODO: For production, consider sharing RdmaContext (and its PD) across
+                // connections to the same device for better memory region sharing.
                 let rdma_ctx = RdmaContext::from_device_context(dev_ctx)?;
 
                 let cq: GenericCompletionQueue = rdma_ctx
@@ -226,7 +231,7 @@ fn blocking_accept(
                     .create_cq_builder()
                     .setup_cqe(1024)
                     .build()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                    .map_err(|e| io::Error::other(e.to_string()))?
                     .into();
 
                 let mut qp = build_qp(&rdma_ctx, &cq, max_send_wr, max_recv_wr)?;
@@ -234,38 +239,40 @@ fn blocking_accept(
                 for state in [QueuePairState::Init, QueuePairState::ReadyToReceive, QueuePairState::ReadyToSend] {
                     let attr = new_id
                         .get_qp_attr(state)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        .map_err(|e| io::Error::other(e.to_string()))?;
                     qp.modify(&attr)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        .map_err(|e| io::Error::other(e.to_string()))?;
                 }
 
                 let mut param = ConnectionParameter::new();
                 param.setup_qp_number(qp.qp_number());
                 new_id.accept(param)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
 
-                pending_ptr = Some(Arc::as_ptr(&new_id) as usize);
-                pending = Some((new_id, rdma_ctx, cq, qp));
+                let id_ptr = Arc::as_ptr(&new_id) as usize;
+                pending.insert(id_ptr, (new_id, rdma_ctx, cq, qp));
             }
             EventType::Established => {
-                if let Some(ptr) = pending_ptr {
-                    if let Some(cm_id) = event.cm_id() {
-                        if Arc::as_ptr(&cm_id) as usize != ptr {
-                            continue;
-                        }
-                    }
+                let cm_id = event
+                    .cm_id()
+                    .ok_or_else(|| io::Error::other("established event without cm_id"))?;
+                
+                let id_ptr = Arc::as_ptr(&cm_id) as usize;
+                
+                if let Some((cm_id, rdma_ctx, cq, qp)) = pending.remove(&id_ptr) {
+                    return Ok(build_connected_transport(cm_id, rdma_ctx, cq, qp));
                 }
-
-                let (cm_id, rdma_ctx, cq, qp) = pending
-                    .take()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "established without pending accept"))?;
-                return Ok(build_connected_transport(cm_id, rdma_ctx, cq, qp));
+                // Ignore Established for unknown connections (shouldn't happen)
             }
-            EventType::Disconnected => {
-                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "rdma cm disconnected"));
+            EventType::Disconnected | EventType::Rejected => {
+                // Clean up any matching pending connection
+                if let Some(cm_id) = event.cm_id() {
+                    let id_ptr = Arc::as_ptr(&cm_id) as usize;
+                    pending.remove(&id_ptr);
+                }
             }
             _ => {
-                // ignore
+                // ignore other events
                 let _ = timeout;
             }
         }

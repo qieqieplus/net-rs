@@ -32,6 +32,7 @@ impl RecvBufferManager {
         self.rx.lock().await.recv().await
     }
 
+    #[allow(dead_code)]
     pub fn sender(&self) -> UnboundedSender<Bytes> {
         self.tx.clone()
     }

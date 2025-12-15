@@ -2,19 +2,28 @@ use sideway::ibverbs::completion::{GenericCompletionQueue, PollCompletionQueueEr
 use sideway::ibverbs::completion::WorkCompletionOperationType;
 use crossbeam::channel::{unbounded, Sender};
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::Waker;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::error;
+
+#[derive(Debug)]
+enum PollerCmd {
+    Register { wr_id: u64, waker: Waker },
+    Cancel { wr_id: u64 },
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Completion {
     pub status: WorkCompletionStatus,
     pub opcode: WorkCompletionOperationType,
     pub byte_len: u32,
+    /// Immediate data associated with this completion (valid for *WithImmediate opcodes).
+    pub imm_data: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -26,7 +35,7 @@ pub struct CompletionEvent {
 #[allow(dead_code)]
 pub struct RdmaPoller {
     cq: GenericCompletionQueue,
-    waker_tx: Sender<(u64, Waker)>,
+    cmd_tx: Sender<PollerCmd>,
     completions: Arc<DashMap<u64, Completion>>,
     shutdown: Arc<AtomicBool>,
     recv_tx: Option<UnboundedSender<CompletionEvent>>,
@@ -42,7 +51,7 @@ impl RdmaPoller {
     }
 
     pub fn new_with_recv(cq: GenericCompletionQueue, recv_tx: Option<UnboundedSender<CompletionEvent>>) -> Self {
-        let (waker_tx, waker_rx) = unbounded::<(u64, Waker)>();
+        let (cmd_tx, cmd_rx) = unbounded::<PollerCmd>();
         let completions = Arc::new(DashMap::<u64, Completion>::new());
         let shutdown = Arc::new(AtomicBool::new(false));
         
@@ -53,12 +62,33 @@ impl RdmaPoller {
 
         let join_handle = thread::spawn(move || {
             let mut wakers: HashMap<u64, Waker> = HashMap::new();
+            let mut canceled: HashSet<u64> = HashSet::new();
             let mut idle_count: u32 = 0;
+            let mut last_err_log = Instant::now();
+            let mut err_suppressed: u64 = 0;
 
             while !shutdown_clone.load(Ordering::Relaxed) {
-                // Drain waker registrations (non-blocking)
-                while let Ok((wr_id, waker)) = waker_rx.try_recv() {
-                    wakers.insert(wr_id, waker);
+                // Drain registration/cancellation commands (non-blocking).
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        PollerCmd::Register { wr_id, waker } => {
+                            // Refresh the waker (it may change between polls).
+                            wakers.insert(wr_id, waker);
+                            // If we previously saw a cancel for this wr_id, drop it: wr_ids are
+                            // expected to be unique for in-flight requests; repeated Register calls
+                            // are normal as the future is polled.
+                            canceled.remove(&wr_id);
+                        }
+                        PollerCmd::Cancel { wr_id } => {
+                            wakers.remove(&wr_id);
+                            // If the completion already arrived, drop it now and do NOT record the
+                            // cancellation (there will be no future completion to consume it).
+                            let had_completion = completions_clone.remove(&wr_id).is_some();
+                            if !had_completion {
+                                canceled.insert(wr_id);
+                            }
+                        }
+                    }
                 }
 
                 // Poll CQ (Sideway's start_poll returns an iterator)
@@ -74,10 +104,31 @@ impl RdmaPoller {
                              let wr_id = completion.wr_id();
 
                              if status != WorkCompletionStatus::Success {
-                                 eprintln!("RDMA WC Error: status={:?} opcode={:?} wr_id={}", status, opcode, wr_id);
+                                 // Avoid blocking I/O in the hot path; rate-limit error logging.
+                                 if last_err_log.elapsed() >= Duration::from_secs(1) {
+                                     if err_suppressed > 0 {
+                                         error!("RDMA WC Error: suppressed {} errors in the last 1s", err_suppressed);
+                                     }
+                                     err_suppressed = 0;
+                                     last_err_log = Instant::now();
+                                 }
+                                 if err_suppressed < 16 {
+                                     error!("RDMA WC Error: status={:?} opcode={:?} wr_id={}", status, opcode, wr_id);
+                                 } else {
+                                     err_suppressed += 1;
+                                 }
                              }
 
-                             let c = Completion { status, opcode, byte_len };
+                             let imm_data = match opcode {
+                                 WorkCompletionOperationType::ReceiveWithImmediate => Some(completion.imm_data()),
+                                 _ => None,
+                             };
+                             let c = Completion {
+                                 status,
+                                 opcode,
+                                 byte_len,
+                                 imm_data,
+                             };
 
                              // Fast-path receive completions to a dedicated consumer (if configured)
                              if matches!(opcode, WorkCompletionOperationType::Receive | WorkCompletionOperationType::ReceiveWithImmediate) {
@@ -86,6 +137,11 @@ impl RdmaPoller {
                                  } else {
                                      completions_clone.insert(wr_id, c);
                                  }
+                                 continue;
+                             }
+
+                             // If the waiter was cancelled, drop the completion and clear the mark.
+                             if canceled.remove(&wr_id) {
                                  continue;
                              }
 
@@ -103,7 +159,8 @@ impl RdmaPoller {
                         idle_count = idle_count.saturating_add(1);
                     }
                     Err(e) => {
-                        eprintln!("Failed to start poll: {:?}", e);
+                        // Not expected in the hot path; still avoid stdout/stderr.
+                        error!("Failed to start poll: {:?}", e);
                         idle_count = idle_count.saturating_add(1);
                     }
                 }
@@ -119,7 +176,7 @@ impl RdmaPoller {
 
         Self {
             cq,
-            waker_tx,
+            cmd_tx,
             completions,
             shutdown,
             recv_tx,
@@ -129,7 +186,15 @@ impl RdmaPoller {
 
     pub fn register(&self, wr_id: u64, waker: Waker) {
         // Best-effort; if poller thread is gone we just stop waking.
-        let _ = self.waker_tx.send((wr_id, waker));
+        let _ = self.cmd_tx.send(PollerCmd::Register { wr_id, waker });
+    }
+
+    /// Best-effort cancellation for an in-flight `wr_id`.
+    ///
+    /// This is primarily used to prevent unbounded growth if the waiting future is dropped
+    /// (timeout/cancellation). It does **not** cancel the underlying RDMA operation.
+    pub fn cancel(&self, wr_id: u64) {
+        let _ = self.cmd_tx.send(PollerCmd::Cancel { wr_id });
     }
 
     pub fn take_completion(&self, wr_id: u64) -> Option<Completion> {

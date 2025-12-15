@@ -47,7 +47,7 @@ impl SlabAllocator {
                 let buf = vec![0u8; chunk_size].into_boxed_slice();
                 let mr: Arc<MemoryRegion> = unsafe {
                     pd.reg_mr(buf.as_ptr() as usize, buf.len(), access)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                        .map_err(|e| io::Error::other(e.to_string()))?
                 };
                 slots.push(ChunkSlot {
                     lkey: mr.lkey(),
