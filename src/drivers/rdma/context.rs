@@ -16,17 +16,17 @@ pub struct RdmaContext {
 impl RdmaContext {
     pub fn open(dev_name: &str) -> io::Result<Arc<Self>> {
         let device_list = DeviceList::new()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         let device = device_list.iter()
             .find(|d| d.name() == dev_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Device {} not found", dev_name)))?;
 
         let ctx = device.open()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         let pd = ctx.alloc_pd()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         let slab = match SlabAllocator::new_default(&pd) {
             Ok(s) => s,
@@ -43,7 +43,7 @@ impl RdmaContext {
     pub fn from_device_context(ctx: Arc<DeviceContext>) -> io::Result<Arc<Self>> {
         let pd = ctx
             .alloc_pd()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         let slab = match SlabAllocator::new_default(&pd) {
             Ok(s) => s,

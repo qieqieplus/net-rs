@@ -30,10 +30,6 @@ pub struct RdmaTransport {
     context: Arc<RdmaContext>,
     pool: Arc<RdmaBufferPool>,
     poller: Arc<RdmaPoller>,
-    // Use Box<dyn ...> is impossible because of GAT.
-    // Making struct generic is hard.
-    // Let's assume GenericQueuePair is the return type for now, or just use `Box<impl QueuePair>`? No.
-    // Compiler suggested: sideway::ibverbs::queue_pair::GenericQueuePair
     qp: Arc<Mutex<GenericQueuePair>>,
     cq: GenericCompletionQueue,
     next_wr_id: Arc<AtomicU64>,
@@ -104,7 +100,7 @@ impl RdmaTransport {
     pub fn new(context: Arc<RdmaContext>) -> io::Result<Self> {
         let cq: GenericCompletionQueue = context.ctx.create_cq_builder()
             .build()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            .map_err(|e| io::Error::other(e.to_string()))?
             .into();
 
         let mut builder = context.pd.create_qp_builder();
@@ -119,7 +115,7 @@ impl RdmaTransport {
             .setup_max_recv_sge(1);
 
         let qp = builder.build()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         let (recv_wc_tx, recv_wc_rx) = mpsc::unbounded_channel();
 
@@ -189,7 +185,7 @@ impl RdmaTransport {
             let mut guard = self.recv_wc_rx.lock().await;
             guard
                 .take()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "receive path already initialized"))?
+                .ok_or_else(|| io::Error::other("receive path already initialized"))?
         };
 
         let recv_len = self.recv_buf_len();
@@ -214,7 +210,7 @@ impl RdmaTransport {
             let mut buf = pool.alloc(recv_len);
             buf.resize(recv_len, 0);
             let mr = RdmaMr::register(context, buf)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to register recv memory"))?;
+                .ok_or_else(|| io::Error::other("Failed to register recv memory"))?;
             Ok(PostedRecvBuf::Dynamic(mr))
         }
 
@@ -236,7 +232,7 @@ impl RdmaTransport {
                 }
                 guard
                     .post()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+                    .map_err(|e| io::Error::other(e.to_string()))
             }
             .await;
             if res.is_err() {
@@ -380,7 +376,7 @@ impl Transport for RdmaTransport {
             framed.extend_from_slice(&(buf.len() as u32).to_be_bytes());
             framed.extend_from_slice(buf.as_ref());
             let mr = RdmaMr::register(&self.context, framed)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to register memory"))?;
+                .ok_or_else(|| io::Error::other("Failed to register memory"))?;
             let lkey = mr.lkey();
             let addr = mr.buf.as_ptr() as u64;
             let len = mr.buf.len() as u32;
@@ -396,7 +392,7 @@ impl Transport for RdmaTransport {
             }
             guard
                 .post()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
         }
 
         PostSendGuard {
