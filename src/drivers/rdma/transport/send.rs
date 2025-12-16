@@ -1,7 +1,7 @@
 //! Send path helpers and supporting types.
 
 use super::completion::wait_for_completion_owned;
-use super::protocol::{encode_credit_imm, IMM_KIND_CLOSE};
+use super::protocol::encode_credit_imm;
 use super::types::PendingSend;
 use crate::drivers::rdma::poller::RdmaPoller;
 use sideway::ibverbs::completion::WorkCompletionStatus;
@@ -88,22 +88,5 @@ pub(crate) async fn send_credit_ack(
     guard.post().map_err(|e| io::Error::other(e.to_string()))?;
 
     debug!("sent credit ACK: {} credits", credits);
-    Ok(())
-}
-
-/// Send a CLOSE message to signal graceful shutdown.
-pub(crate) async fn send_close_msg(
-    qp: &Arc<Mutex<GenericQueuePair>>,
-    next_wr_id: &Arc<AtomicU64>,
-) -> io::Result<()> {
-    let close_wr_id = next_wr_id.fetch_add(1, Ordering::Relaxed);
-
-    let mut qp_guard = qp.lock().await;
-    let mut guard = qp_guard.start_post_send();
-    let wr = guard.construct_wr(close_wr_id, WorkRequestFlags::Signaled);
-    wr.setup_send_imm(IMM_KIND_CLOSE);
-    guard.post().map_err(|e| io::Error::other(e.to_string()))?;
-
-    debug!("sent CLOSE message");
     Ok(())
 }

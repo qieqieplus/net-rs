@@ -26,6 +26,7 @@
 //! - `recv` - Receive path logic
 //! - `rdma_ops` - RDMA READ/WRITE operations
 
+mod batch;
 mod completion;
 pub mod config;
 mod flow_control;
@@ -34,8 +35,10 @@ mod rdma_ops;
 mod recv;
 mod recv_pool;
 mod send;
+mod shutdown;
 mod types;
 
+pub use batch::{BatchResult, RdmaReadOp, RdmaWriteOp};
 pub use config::TransportConfig;
 
 use crate::drivers::rdma::buffer::{RdmaBufferPool, RdmaMr};
@@ -64,7 +67,8 @@ use tracing::{debug, warn};
 
 use completion::make_completion_future;
 use recv::{alloc_recv_buffer, handle_recv_completion, post_recv_wr};
-use send::{send_close_msg, PostSendGuard, SignaledSendReaper};
+use send::{PostSendGuard, SignaledSendReaper};
+use shutdown::{graceful_shutdown, ShutdownConfig, ShutdownResult};
 use types::{PendingSend, PostedRecvBuf, SendKeepalive};
 
 /// High-performance RDMA transport with credit-based flow control and signal batching.
@@ -349,34 +353,32 @@ impl RdmaTransport {
 
     /// Gracefully shutdown the transport connection.
     ///
-    /// Sends a CLOSE message to the peer and waits for acknowledgment (or timeout).
+    /// Sends a CLOSE message to the peer, waits for acknowledgment, drains CQ,
+    /// and transitions QP to Error state if timeout is reached.
     pub async fn shutdown(&self) -> io::Result<()> {
-        // Mark shutdown as initiated (SeqCst for visibility across threads)
-        if self.shutdown_initiated.swap(true, Ordering::SeqCst) {
-            return Ok(()); // Already shutting down
-        }
+        let config = ShutdownConfig::default();
+        let result = graceful_shutdown(
+            &self.qp,
+            &self.next_wr_id,
+            &self.poller,
+            &self.shutdown_initiated,
+            &self.shutdown_received,
+            &config,
+        )
+        .await;
 
-        debug!("initiating graceful shutdown");
-
-        // Send CLOSE message to peer
-        if let Err(e) = send_close_msg(&self.qp, &self.next_wr_id).await {
-            warn!("failed to send CLOSE message: {}", e);
-        }
-
-        // Wait for peer CLOSE or timeout
-        const SHUTDOWN_TIMEOUT_MS: u64 = 200;
-        const POLL_INTERVAL_MS: u64 = 10;
-        
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(SHUTDOWN_TIMEOUT_MS);
-        while tokio::time::Instant::now() < deadline {
-            if self.shutdown_received.load(Ordering::SeqCst) {
-                debug!("received CLOSE from peer, shutdown complete");
-                return Ok(());
+        match result {
+            ShutdownResult::Graceful => {
+                debug!("graceful shutdown completed");
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+            ShutdownResult::ForcedError => {
+                debug!("shutdown forced QP to Error state");
+            }
+            ShutdownResult::AlreadyShuttingDown => {
+                debug!("shutdown already in progress");
+            }
         }
 
-        debug!("shutdown timeout, proceeding anyway");
         Ok(())
     }
 }

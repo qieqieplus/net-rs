@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-const MAX_MSG_SIZE: usize = 1024 * 1024; // 1MB
+const MAX_MSG_SIZE: usize = 512 * 1024 * 1024; // 1MB
 
 #[derive(Clone, Default)]
 pub struct TcpBufferPool;
