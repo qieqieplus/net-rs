@@ -259,8 +259,7 @@ pub(crate) fn extract_received_message(
             }
         }
         PostedRecvBuf::Dynamic(mr) => {
-            let RdmaMr { mr: _mr, mut buf } = mr;
-            drop(_mr);
+            let mut buf = mr.into_inner();
             buf.truncate(received.min(recv_len));
             let msg_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
             if msg_len <= buf.len().saturating_sub(4) {

@@ -9,7 +9,9 @@ A generic, high-performance async networking library for Rust, designed to suppo
 - **TCP Driver**: Tokio-based implementation with length-delimited framing.
 - **RDMA Driver**: High-performance implementation using the `sideway` crate.
   - **Zero-Copy Memory**: Slab allocator with pre-registered memory regions to eliminate registration overhead.
-  - **Batched Receives**: Maintained depth of 512 pre-posted receive buffers to prevent RNR errors.
+  - **Flow Control**: Credit-based mechanism (`IBV_WR_SEND_WITH_IMM`) to prevent receiver buffer overflow.
+  - **Signal Batching**: Intelligent send signaling to reduce completion queue overhead.
+  - **One-Sided Ops**: Native support for RDMA READ and WRITE operations (`rdma_read`, `rdma_write`).
   - **Lock-Free Polling**: Optimized CQ poller using `DashMap` and adaptive busy-waiting.
 - **Connection Pooling**: Generic `ConnectionPool` with reconnection policies and connection lifecycle management.
 
@@ -55,13 +57,22 @@ Enable the `rdma` feature.
 ```rust
 use net_rs::drivers::rdma::cm;
 use net_rs::transport::Transport;
+use net_rs::drivers::rdma::transport::TransportConfig;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    // Advanced: Configure transport parameters
+    let config = TransportConfig::builder()
+        .with_buf_ack_batch(16)
+        .with_send_signal_batch(16)
+        .with_max_outstanding_sends(64);
+
     // RDMA-CM connect: creates an RC QP and transitions it to RTS via RDMA CM events.
     let server: SocketAddr = "192.168.1.10:18515".parse().unwrap();
+    // Use cm::connect_with_config if custom config is needed (API to be exposed)
+    // currently default connect() uses default config.
     let transport = cm::connect(server, Duration::from_secs(2)).await?;
 
     transport.send(bytes::Bytes::from_static(b"ping")).await?;
@@ -88,12 +99,14 @@ cargo run --example rdma_echo_client --features rdma -- 192.168.1.10:18515
 - **`transport`**: Core traits (`Transport`, `BufferPool`) and connection logic.
 - **`drivers/tcp`**: Standard socket-based implementation.
 - **`drivers/rdma`**:
-  - `context.rs`: Device context and Protection Domain management.
-  - `slab_allocator.rs`: Fixed-size slab allocator for zero-copy memory management.
-  - `recv_pool.rs`: Manager for pre-posted receive buffers and credit replenishment.
-  - `buffer.rs`: Memory Region registration and fallback allocator.
-  - `transport.rs`: Queue Pair (RC) implementation and batch receive logic.
-  - `poller.rs`: Background thread for CQ POLLING with fast-path completion delivery.
+  - **`context`**: Device context and Protection Domain management.
+  - **`slab_allocator`**: Fixed-size slab allocator for zero-copy memory management.
+  - **`transport`**:
+    - **`mod`**: Core RC Queue Pair logic, initialization, and lifecycle.
+    - **`flow_control`**: Semaphore-based credit system.
+    - **`rdma_ops`**: One-sided RDMA READ/WRITE operations.
+    - **`recv_pool`**: Async receive buffer management.
+  - **`poller`**: Background thread for CQ POLLING with fast-path completion delivery.
 
 ## License
 

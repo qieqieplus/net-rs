@@ -136,11 +136,11 @@ mod tests {
     #[test]
     fn test_remote_buf_advance() {
         let mut buf = RemoteBuf::new(0x1000, 256, 0x123);
-        
+
         assert!(buf.advance(100));
         assert_eq!(buf.addr(), 0x1064);
         assert_eq!(buf.len(), 156);
-        
+
         assert!(!buf.advance(200));
         assert_eq!(buf.addr(), 0x1064);
         assert_eq!(buf.len(), 156);
@@ -149,11 +149,11 @@ mod tests {
     #[test]
     fn test_remote_buf_subtract() {
         let mut buf = RemoteBuf::new(0x1000, 256, 0x123);
-        
+
         assert!(buf.subtract(100));
         assert_eq!(buf.addr(), 0x1000);
         assert_eq!(buf.len(), 156);
-        
+
         assert!(!buf.subtract(200));
         assert_eq!(buf.len(), 156);
     }
@@ -161,12 +161,12 @@ mod tests {
     #[test]
     fn test_remote_buf_subrange() {
         let buf = RemoteBuf::new(0x1000, 256, 0x123);
-        
+
         let sub = buf.subrange(64, 128);
         assert_eq!(sub.addr(), 0x1040);
         assert_eq!(sub.len(), 128);
         assert_eq!(sub.rkey(), 0x123);
-        
+
         let invalid = buf.subrange(200, 100);
         assert!(!invalid.is_valid());
     }
@@ -174,11 +174,11 @@ mod tests {
     #[test]
     fn test_remote_buf_first_last() {
         let buf = RemoteBuf::new(0x1000, 256, 0x123);
-        
+
         let first = buf.first(64);
         assert_eq!(first.addr(), 0x1000);
         assert_eq!(first.len(), 64);
-        
+
         let last = buf.last(64);
         assert_eq!(last.addr(), 0x10c0);
         assert_eq!(last.len(), 64);
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn test_remote_buf_take_first() {
         let mut buf = RemoteBuf::new(0x1000, 256, 0x123);
-        
+
         let first = buf.take_first(64);
         assert_eq!(first.addr(), 0x1000);
         assert_eq!(first.len(), 64);
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn test_remote_buf_take_last() {
         let mut buf = RemoteBuf::new(0x1000, 256, 0x123);
-        
+
         let last = buf.take_last(64);
         assert_eq!(last.addr(), 0x10c0);
         assert_eq!(last.len(), 64);

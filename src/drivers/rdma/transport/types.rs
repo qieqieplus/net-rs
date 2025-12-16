@@ -25,6 +25,7 @@ pub(crate) enum PostedRecvBuf {
 
 impl PostedRecvBuf {
     /// Get the scatter-gather entry parameters for this buffer.
+    #[inline]
     pub fn sge(&self, recv_len: usize) -> (u32, u64, u32) {
         match self {
             PostedRecvBuf::Slab(chunk) => {
@@ -34,8 +35,8 @@ impl PostedRecvBuf {
             }
             PostedRecvBuf::Dynamic(mr) => {
                 // Defensive: cap at actual buffer length
-                let len = recv_len.min(mr.buf.len()) as u32;
-                (mr.lkey(), mr.buf.as_ptr() as u64, len)
+                let len = recv_len.min(mr.as_slice().len()) as u32;
+                (mr.lkey(), mr.as_slice().as_ptr() as u64, len)
             }
         }
     }

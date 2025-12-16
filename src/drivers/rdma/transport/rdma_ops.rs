@@ -7,8 +7,39 @@ use crate::drivers::rdma::buffer::RdmaMr;
 use crate::drivers::rdma::RemoteBuf;
 use crate::transport::BufferPool;
 use sideway::ibverbs::completion::WorkCompletionStatus;
-use sideway::ibverbs::queue_pair::{QueuePair, PostSendGuard as _, SetScatterGatherEntry, WorkRequestFlags};
+use sideway::ibverbs::queue_pair::{PostSendGuard as _, QueuePair, SetScatterGatherEntry, WorkRequestFlags};
 use std::io;
+
+/// Validate remote and local buffers for an RDMA operation.
+///
+/// Returns `Ok(())` if buffers are valid, or an appropriate `io::Error` otherwise.
+#[inline]
+fn validate_rdma_buffers(remote: &RemoteBuf, local_len: usize, op_name: &str) -> io::Result<()> {
+    if !remote.is_valid() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: invalid remote buffer", op_name),
+        ));
+    }
+    if local_len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: empty local buffer", op_name),
+        ));
+    }
+    if local_len as u64 > remote.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{}: local buffer ({}) exceeds remote buffer ({})",
+                op_name,
+                local_len,
+                remote.len()
+            ),
+        ));
+    }
+    Ok(())
+}
 
 impl RdmaTransport {
     /// Perform an RDMA WRITE operation to the remote buffer.
@@ -20,35 +51,14 @@ impl RdmaTransport {
     /// * `remote` - Remote buffer descriptor (address, length, rkey)
     /// * `local` - Local data to write
     pub async fn rdma_write(&self, remote: &RemoteBuf, local: &[u8]) -> io::Result<()> {
-        // Validate arguments
-        if !remote.is_valid() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid remote buffer",
-            ));
-        }
-        if local.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Empty local buffer",
-            ));
-        }
-        if local.len() as u64 > remote.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Local buffer ({}) exceeds remote buffer ({})",
-                    local.len(),
-                    remote.len()
-                ),
-            ));
-        }
+        validate_rdma_buffers(remote, local.len(), "RDMA WRITE")?;
 
-        // Allocate and register local memory for RDMA (fallback path; callers can avoid this by using rdma_write_mr).
+        // Allocate and register local memory for RDMA
+        // (fallback path; callers can avoid this by using rdma_write_mr).
         let mut buf = self.pool.alloc(local.len());
         buf.extend_from_slice(local);
         let local_mr = RdmaMr::register(&self.context, buf)
-            .ok_or_else(|| io::Error::other("Failed to register local memory"))?;
+            .ok_or_else(|| io::Error::other("RDMA WRITE: failed to register local memory"))?;
 
         self.rdma_write_mr(remote, &local_mr).await
     }
@@ -62,29 +72,7 @@ impl RdmaTransport {
     /// * `remote` - Remote buffer descriptor (address, length, rkey)
     /// * `local` - Local buffer to read into
     pub async fn rdma_read(&self, remote: &RemoteBuf, local: &mut [u8]) -> io::Result<()> {
-        // Validate arguments
-        if !remote.is_valid() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid remote buffer",
-            ));
-        }
-        if local.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Empty local buffer",
-            ));
-        }
-        if local.len() as u64 > remote.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Local buffer ({}) exceeds remote buffer ({})",
-                    local.len(),
-                    remote.len()
-                ),
-            ));
-        }
+        validate_rdma_buffers(remote, local.len(), "RDMA READ")?;
 
         // Allocate and register a scratch local region for RDMA, then copy back.
         // Callers can avoid this per-op registration by using rdma_read_mr.
@@ -93,10 +81,10 @@ impl RdmaTransport {
             buf.set_len(local.len());
         }
         let mut local_mr = RdmaMr::register(&self.context, buf)
-            .ok_or_else(|| io::Error::other("Failed to register local memory"))?;
+            .ok_or_else(|| io::Error::other("RDMA READ: failed to register local memory"))?;
 
         self.rdma_read_mr(remote, &mut local_mr).await?;
-        local.copy_from_slice(&local_mr.buf[..local.len()]);
+        local.copy_from_slice(&local_mr.as_slice()[..local.len()]);
         Ok(())
     }
 
@@ -104,32 +92,11 @@ impl RdmaTransport {
     ///
     /// This avoids per-operation memory registration (`ibv_reg_mr`) in the hot path.
     pub async fn rdma_write_mr(&self, remote: &RemoteBuf, local: &RdmaMr) -> io::Result<()> {
-        if !remote.is_valid() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid remote buffer",
-            ));
-        }
-        if local.buf.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Empty local MR buffer",
-            ));
-        }
-        if local.buf.len() as u64 > remote.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Local MR buffer ({}) exceeds remote buffer ({})",
-                    local.buf.len(),
-                    remote.len()
-                ),
-            ));
-        }
+        validate_rdma_buffers(remote, local.as_slice().len(), "RDMA WRITE")?;
 
         let lkey = local.lkey();
-        let local_addr = local.buf.as_ptr() as u64;
-        let len = local.buf.len() as u32;
+        let local_addr = local.as_slice().as_ptr() as u64;
+        let len = local.as_slice().len() as u32;
 
         let _permit = self
             .rdma_semaphore
@@ -160,34 +127,13 @@ impl RdmaTransport {
 
     /// RDMA READ into a pre-registered local memory region.
     ///
-    /// The read length is `local.buf.len()`.
+    /// The read length is `local.as_slice().len()`.
     pub async fn rdma_read_mr(&self, remote: &RemoteBuf, local: &mut RdmaMr) -> io::Result<()> {
-        if !remote.is_valid() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid remote buffer",
-            ));
-        }
-        if local.buf.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Empty local MR buffer",
-            ));
-        }
-        if local.buf.len() as u64 > remote.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Local MR buffer ({}) exceeds remote buffer ({})",
-                    local.buf.len(),
-                    remote.len()
-                ),
-            ));
-        }
+        validate_rdma_buffers(remote, local.as_slice().len(), "RDMA READ")?;
 
         let lkey = local.lkey();
-        let local_addr = local.buf.as_ptr() as u64;
-        let len = local.buf.len() as u32;
+        let local_addr = local.as_mut_slice().as_ptr() as u64;
+        let len = local.as_slice().len() as u32;
 
         let _permit = self
             .rdma_semaphore

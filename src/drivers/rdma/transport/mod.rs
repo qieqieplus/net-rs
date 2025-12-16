@@ -1,10 +1,20 @@
 //! RDMA Transport implementation.
 //!
 //! This module provides a high-performance RDMA-based transport layer with:
-//! - Credit-based flow control
+//! - Credit-based flow control for backpressure
 //! - Signal batching for reduced completion overhead
 //! - Slab allocation for efficient buffer management
-//! - One-sided RDMA READ/WRITE operations
+//! - One-sided RDMA READ/WRITE operations for zero-copy transfers
+//!
+//! # Architecture
+//!
+//! The transport is built on top of the `sideway` RDMA library and integrates with
+//! the generic `Transport` trait. Key components:
+//!
+//! - **FlowController**: Semaphore-based credit system preventing sender overflow
+//! - **RecvBufferManager**: Async channel decoupling completions from recv() calls
+//! - **RdmaPoller**: Background thread polling the completion queue
+//! - **SlabAllocator**: Pre-registered memory pools avoiding per-send registration
 //!
 //! # Module Structure
 //!
@@ -58,17 +68,19 @@ use send::{send_close_msg, PostSendGuard, SignaledSendReaper};
 use types::{PendingSend, PostedRecvBuf, SendKeepalive};
 
 /// High-performance RDMA transport with credit-based flow control and signal batching.
-#[allow(dead_code)]
 pub struct RdmaTransport {
     pub(crate) context: Arc<RdmaContext>,
     pub(crate) pool: Arc<RdmaBufferPool>,
     pub(crate) poller: Arc<RdmaPoller>,
     pub(crate) qp: Arc<Mutex<GenericQueuePair>>,
-    cq: GenericCompletionQueue,
     pub(crate) next_wr_id: Arc<AtomicU64>,
     max_recv_bytes: usize,
-    _cm_id: Option<Arc<Identifier>>,
+    #[allow(dead_code)]
+    cq: GenericCompletionQueue,
+    #[allow(dead_code)]
+    cm_id: Option<Arc<Identifier>>,
 
+    // Lazy initialization
     started: OnceCell<()>,
     recv_manager: Arc<RecvBufferManager>,
     recv_wc_rx: Mutex<Option<mpsc::UnboundedReceiver<crate::drivers::rdma::poller::CompletionEvent>>>,
@@ -91,11 +103,59 @@ pub struct RdmaTransport {
     pending_sends: Arc<StdMutex<VecDeque<PendingSend>>>,
 }
 
+// SAFETY: RdmaTransport is Send+Sync because all its fields are either:
+// - Arc<T> where T: Send+Sync (context, pool, poller, etc.)
+// - Mutex-protected types (qp, recv_wc_rx)
+// - Atomics (next_wr_id, shutdown flags)
+// The underlying RDMA resources are thread-safe when accessed through the ibverbs API.
 unsafe impl Send for RdmaTransport {}
 unsafe impl Sync for RdmaTransport {}
 
+/// Internal struct for building transport state, used to deduplicate constructor logic.
+struct TransportParts {
+    context: Arc<RdmaContext>,
+    cq: GenericCompletionQueue,
+    qp: GenericQueuePair,
+    config: TransportConfig,
+    cm_id: Option<Arc<Identifier>>,
+}
+
+impl TransportParts {
+    /// Build the full RdmaTransport from pre-configured parts.
+    fn into_transport(self) -> RdmaTransport {
+        let (recv_wc_tx, recv_wc_rx) = mpsc::unbounded_channel();
+        
+        RdmaTransport {
+            pool: Arc::new(RdmaBufferPool::new(self.context.clone())),
+            poller: Arc::new(RdmaPoller::new_with_recv(self.cq.clone(), Some(recv_wc_tx))),
+            qp: Arc::new(Mutex::new(self.qp)),
+            cq: self.cq,
+            next_wr_id: Arc::new(AtomicU64::new(1)),
+            max_recv_bytes: DEFAULT_MAX_RECV_BYTES,
+            cm_id: self.cm_id,
+
+            started: OnceCell::new(),
+            recv_manager: RecvBufferManager::new(DEFAULT_RECV_DEPTH),
+            recv_wc_rx: Mutex::new(Some(recv_wc_rx)),
+            posted_recvs: Arc::new(DashMap::new()),
+
+            flow_controller: Arc::new(FlowController::new(self.config.max_outstanding_sends)),
+            recv_not_acked: Arc::new(AtomicU64::new(0)),
+            send_not_signaled: Arc::new(AtomicU64::new(0)),
+            rdma_semaphore: Arc::new(tokio::sync::Semaphore::new(self.config.max_rdma_wr)),
+            config: self.config,
+
+            shutdown_initiated: Arc::new(AtomicBool::new(false)),
+            shutdown_received: Arc::new(AtomicBool::new(false)),
+            pending_sends: Arc::new(StdMutex::new(VecDeque::new())),
+            context: self.context,
+        }
+    }
+}
+
 impl RdmaTransport {
     /// Create a new RDMA transport with default configuration.
+    #[inline]
     pub fn new(context: Arc<RdmaContext>) -> io::Result<Self> {
         Self::with_config(context, TransportConfig::default())
     }
@@ -109,64 +169,43 @@ impl RdmaTransport {
             .map_err(|e| io::Error::other(e.to_string()))?
             .into();
 
-        let mut builder = context.pd.create_qp_builder();
-        builder.setup_send_cq(cq.clone());
-        builder.setup_recv_cq(cq.clone());
-        builder.setup_qp_type(QueuePairType::ReliableConnection);
-        // Ensure the QP supports the default receive depth.
+        let qp = Self::build_queue_pair(&context, &cq, &config)?;
+
+        Ok(TransportParts {
+            context,
+            cq,
+            qp,
+            config,
+            cm_id: None,
+        }
+        .into_transport())
+    }
+
+    /// Build a queue pair with the given configuration.
+    pub(crate) fn build_queue_pair(
+        context: &RdmaContext,
+        cq: &GenericCompletionQueue,
+        config: &TransportConfig,
+    ) -> io::Result<GenericQueuePair> {
         let desired_send_wr = DEFAULT_RECV_DEPTH.max(
             config
                 .max_outstanding_sends
                 .saturating_add(config.max_rdma_wr)
                 .saturating_add(64),
         );
+
+        let mut builder = context.pd.create_qp_builder();
+        builder.setup_send_cq(cq.clone());
+        builder.setup_recv_cq(cq.clone());
+        builder.setup_qp_type(QueuePairType::ReliableConnection);
         builder
             .setup_max_send_wr((desired_send_wr.min(u32::MAX as usize)) as u32)
             .setup_max_send_sge(1)
             .setup_max_recv_wr(DEFAULT_RECV_DEPTH as u32)
             .setup_max_recv_sge(1);
 
-        let qp = builder
-            .build()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        let (recv_wc_tx, recv_wc_rx) = mpsc::unbounded_channel();
-
-        Ok(Self {
-            pool: Arc::new(RdmaBufferPool::new(context.clone())),
-            context,
-            poller: Arc::new(RdmaPoller::new_with_recv(cq.clone(), Some(recv_wc_tx))),
-            qp: Arc::new(Mutex::new(GenericQueuePair::Basic(qp))),
-            cq,
-            next_wr_id: Arc::new(AtomicU64::new(1)),
-            max_recv_bytes: DEFAULT_MAX_RECV_BYTES,
-            _cm_id: None,
-
-            started: OnceCell::new(),
-            recv_manager: RecvBufferManager::new(DEFAULT_RECV_DEPTH),
-            recv_wc_rx: Mutex::new(Some(recv_wc_rx)),
-            posted_recvs: Arc::new(DashMap::new()),
-
-            flow_controller: Arc::new(FlowController::new(config.max_outstanding_sends)),
-            recv_not_acked: Arc::new(AtomicU64::new(0)),
-            send_not_signaled: Arc::new(AtomicU64::new(0)),
-            rdma_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_rdma_wr)),
-            config,
-
-            shutdown_initiated: Arc::new(AtomicBool::new(false)),
-            shutdown_received: Arc::new(AtomicBool::new(false)),
-            pending_sends: Arc::new(StdMutex::new(VecDeque::new())),
-        })
-    }
-
-    /// Create a transport from an already-connected CM ID.
-    pub(crate) fn from_connected(
-        cm_id: Arc<Identifier>,
-        context: Arc<RdmaContext>,
-        cq: GenericCompletionQueue,
-        qp: GenericQueuePair,
-    ) -> Self {
-        Self::from_connected_with_config(cm_id, context, cq, qp, TransportConfig::default())
+        let qp = builder.build().map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(GenericQueuePair::Basic(qp))
     }
 
     /// Create a transport from an already-connected CM ID with custom configuration.
@@ -177,46 +216,31 @@ impl RdmaTransport {
         qp: GenericQueuePair,
         config: TransportConfig,
     ) -> Self {
-        let (recv_wc_tx, recv_wc_rx) = mpsc::unbounded_channel();
-        Self {
-            pool: Arc::new(RdmaBufferPool::new(context.clone())),
-            poller: Arc::new(RdmaPoller::new_with_recv(cq.clone(), Some(recv_wc_tx))),
-            qp: Arc::new(Mutex::new(qp)),
-            cq,
-            next_wr_id: Arc::new(AtomicU64::new(1)),
-            max_recv_bytes: DEFAULT_MAX_RECV_BYTES,
+        TransportParts {
             context,
-            _cm_id: Some(cm_id),
-
-            started: OnceCell::new(),
-            recv_manager: RecvBufferManager::new(DEFAULT_RECV_DEPTH),
-            recv_wc_rx: Mutex::new(Some(recv_wc_rx)),
-            posted_recvs: Arc::new(DashMap::new()),
-
-            flow_controller: Arc::new(FlowController::new(config.max_outstanding_sends)),
-            recv_not_acked: Arc::new(AtomicU64::new(0)),
-            send_not_signaled: Arc::new(AtomicU64::new(0)),
-            rdma_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_rdma_wr)),
+            cq,
+            qp,
             config,
-
-            shutdown_initiated: Arc::new(AtomicBool::new(false)),
-            shutdown_received: Arc::new(AtomicBool::new(false)),
-            pending_sends: Arc::new(StdMutex::new(VecDeque::new())),
+            cm_id: Some(cm_id),
         }
+        .into_transport()
     }
 
     /// Set the maximum receive buffer size.
+    #[inline]
     pub fn with_max_recv_bytes(mut self, max_recv_bytes: usize) -> Self {
         self.max_recv_bytes = max_recv_bytes;
         self
     }
 
     /// Allocate a new work request ID.
+    #[inline]
     pub(crate) fn alloc_wr_id(&self) -> u64 {
         self.next_wr_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Get the receive buffer length (header + max payload).
+    #[inline]
     fn recv_buf_len(&self) -> usize {
         4 + self.max_recv_bytes
     }
@@ -241,6 +265,7 @@ impl RdmaTransport {
         let recv_len = self.recv_buf_len();
         let depth = self.recv_manager.target_depth;
 
+        // Clone Arcs for the spawned task
         let qp = Arc::clone(&self.qp);
         let posted_recvs = Arc::clone(&self.posted_recvs);
         let context = Arc::clone(&self.context);
@@ -252,43 +277,19 @@ impl RdmaTransport {
         let buf_ack_batch = self.config.buf_ack_batch;
         let shutdown_received = Arc::clone(&self.shutdown_received);
 
-        // Pre-post receive buffers to establish initial receive depth.
-        //
-        // We treat this as best-effort: if we fail part-way through, we still start the receive
-        // completion task with the buffers that *were* posted, rather than returning an error and
-        // leaving the QP in a half-initialized state.
-        let mut posted_cnt: usize = 0;
-        for _ in 0..depth {
-            let wr_id = next_wr_id.fetch_add(1, Ordering::Relaxed);
-            let buf = match alloc_recv_buffer(&context, &pool, recv_len) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!("failed to allocate initial recv buffer: {e} (posted={posted_cnt}/{depth})");
-                    break;
-                }
-            };
-            if let Err(e) = post_recv_wr(&qp, &posted_recvs, wr_id, buf, recv_len).await {
-                warn!("failed to post initial recv buffer: {e} (posted={posted_cnt}/{depth})");
-                break;
-            }
-            posted_cnt += 1;
-        }
+        // Pre-post receive buffers (best-effort: continue with whatever we can post)
+        let posted_cnt = self
+            .pre_post_receive_buffers(&qp, &posted_recvs, &context, &pool, &next_wr_id, recv_len, depth)
+            .await;
 
         if posted_cnt == 0 {
             *self.recv_wc_rx.lock().await = Some(wc_rx);
-            return Err(io::Error::other(
-                "failed to post any initial receive buffers",
-            ));
+            return Err(io::Error::other("failed to post any initial receive buffers"));
         }
 
         // Spawn background task: process receive completions
         tokio::spawn(async move {
-            loop {
-                let ev = match wc_rx.recv().await {
-                    Some(ev) => ev,
-                    None => break,
-                };
-
+            while let Some(ev) = wc_rx.recv().await {
                 handle_recv_completion(
                     ev,
                     &posted_recvs,
@@ -310,7 +311,38 @@ impl RdmaTransport {
         Ok(())
     }
 
+    /// Pre-post receive buffers to establish initial receive depth.
+    async fn pre_post_receive_buffers(
+        &self,
+        qp: &Arc<Mutex<GenericQueuePair>>,
+        posted_recvs: &Arc<DashMap<u64, PostedRecvBuf>>,
+        context: &Arc<RdmaContext>,
+        pool: &Arc<RdmaBufferPool>,
+        next_wr_id: &Arc<AtomicU64>,
+        recv_len: usize,
+        depth: usize,
+    ) -> usize {
+        let mut posted_cnt = 0;
+        for _ in 0..depth {
+            let wr_id = next_wr_id.fetch_add(1, Ordering::Relaxed);
+            let buf = match alloc_recv_buffer(context, pool, recv_len) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("failed to allocate initial recv buffer: {e} (posted={posted_cnt}/{depth})");
+                    break;
+                }
+            };
+            if let Err(e) = post_recv_wr(qp, posted_recvs, wr_id, buf, recv_len).await {
+                warn!("failed to post initial recv buffer: {e} (posted={posted_cnt}/{depth})");
+                break;
+            }
+            posted_cnt += 1;
+        }
+        posted_cnt
+    }
+
     /// Wait for a completion event for the given work request ID.
+    #[inline]
     pub fn wait_for_completion(&self, wr_id: u64) -> impl Future<Output = io::Result<Completion>> + '_ {
         make_completion_future(Arc::clone(&self.poller), wr_id)
     }
@@ -318,15 +350,10 @@ impl RdmaTransport {
     /// Gracefully shutdown the transport connection.
     ///
     /// Sends a CLOSE message to the peer and waits for acknowledgment (or timeout).
-    /// This ensures both sides cleanly terminate the connection.
     pub async fn shutdown(&self) -> io::Result<()> {
-        // Mark shutdown as initiated
-        if self
-            .shutdown_initiated
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            // Already shutting down
-            return Ok(());
+        // Mark shutdown as initiated (SeqCst for visibility across threads)
+        if self.shutdown_initiated.swap(true, Ordering::SeqCst) {
+            return Ok(()); // Already shutting down
         }
 
         debug!("initiating graceful shutdown");
@@ -334,22 +361,19 @@ impl RdmaTransport {
         // Send CLOSE message to peer
         if let Err(e) = send_close_msg(&self.qp, &self.next_wr_id).await {
             warn!("failed to send CLOSE message: {}", e);
-            // Continue with shutdown anyway
         }
 
         // Wait for peer CLOSE or timeout
-        let timeout = tokio::time::Duration::from_millis(200);
-        let deadline = tokio::time::Instant::now() + timeout;
-
+        const SHUTDOWN_TIMEOUT_MS: u64 = 200;
+        const POLL_INTERVAL_MS: u64 = 10;
+        
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(SHUTDOWN_TIMEOUT_MS);
         while tokio::time::Instant::now() < deadline {
-            if self
-                .shutdown_received
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
+            if self.shutdown_received.load(Ordering::SeqCst) {
                 debug!("received CLOSE from peer, shutdown complete");
                 return Ok(());
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
 
         debug!("shutdown timeout, proceeding anyway");
@@ -360,7 +384,7 @@ impl RdmaTransport {
 #[async_trait]
 impl Transport for RdmaTransport {
     async fn send(&self, buf: Bytes) -> io::Result<()> {
-        // Ensure the background receive path is running (helps avoid RNRs under load).
+        // Ensure background receive path is running (helps avoid RNRs under load)
         let _ = self.ensure_started().await;
 
         // 1. Acquire send credit (blocks if none available)
@@ -368,31 +392,11 @@ impl Transport for RdmaTransport {
 
         let wr_id = self.alloc_wr_id();
 
-        // Frame like TCP transport: u32 length prefix (big endian) + payload.
+        // Frame: u32 length prefix (big endian) + payload
         let total_len = 4 + buf.len();
 
-        let (lkey, addr, len, keepalive) = if let Some(mut chunk) = self.context.slab.alloc(total_len)
-        {
-            let slice = chunk.as_mut_slice();
-            slice[0..4].copy_from_slice(&(buf.len() as u32).to_be_bytes());
-            slice[4..4 + buf.len()].copy_from_slice(buf.as_ref());
-            (
-                chunk.lkey(),
-                chunk.as_ptr() as u64,
-                total_len as u32,
-                SendKeepalive::Slab(chunk),
-            )
-        } else {
-            let mut framed = BytesMut::with_capacity(total_len);
-            framed.extend_from_slice(&(buf.len() as u32).to_be_bytes());
-            framed.extend_from_slice(buf.as_ref());
-            let mr = RdmaMr::register(&self.context, framed)
-                .ok_or_else(|| io::Error::other("Failed to register memory"))?;
-            let lkey = mr.lkey();
-            let addr = mr.buf.as_ptr() as u64;
-            let len = mr.buf.len() as u32;
-            (lkey, addr, len, SendKeepalive::Dynamic(mr))
-        };
+        // Prepare send buffer (prefer slab allocation to avoid registration)
+        let (lkey, addr, len, keepalive) = self.prepare_send_buffer(&buf, total_len)?;
 
         // 2. Determine if this send should be signaled (batching)
         let sends_since_signal = self.send_not_signaled.fetch_add(1, Ordering::Relaxed);
@@ -405,6 +409,23 @@ impl Transport for RdmaTransport {
             WorkRequestFlags::none()
         };
 
+        // SAFETY-CRITICAL: Keepalive must be stored BEFORE posting the WR.
+        //
+        // If we were to post first and then panic (e.g. due to a poisoned mutex),
+        // the keepalive would be dropped while the NIC may still DMA from it (UB).
+        {
+            // Treat poisoning as recoverable: we must not panic after posting a WR.
+            let mut pending = self
+                .pending_sends
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.push_back(PendingSend {
+                wr_id,
+                _keepalive: keepalive,
+            });
+        }
+
+        // Post the work request. If posting fails, remove the keepalive entry to avoid leaks.
         {
             let mut qp = self.qp.lock().await;
             let mut guard = qp.start_post_send();
@@ -412,47 +433,21 @@ impl Transport for RdmaTransport {
             unsafe {
                 wr.setup_send().setup_sge(lkey, addr, len);
             }
-            guard
-                .post()
-                .map_err(|e| io::Error::other(e.to_string()))?;
-        }
-
-        // Keep the send buffer alive until a signaled completion proves it's safe to release.
-        // We do this *synchronously* so cancellation cannot drop the buffer early.
-        {
-            let mut pending = self.pending_sends.lock().expect("pending_sends poisoned");
-            pending.push_back(PendingSend {
-                wr_id,
-                _keepalive: keepalive,
-            });
-        }
-
-        // 3. Handle completion based on signaling
-        if should_signal {
-            let mut reaper = SignaledSendReaper {
-                poller: Arc::clone(&self.poller),
-                pending_sends: Arc::clone(&self.pending_sends),
-                wr_id,
-                done: false,
-            };
-
-            PostSendGuard {
-                poller: &self.poller,
-                wr_id,
-            }
-            .wait()
-            .await?;
-
-            // Clean up all pending sends up to (and including) this wr_id (RC ordering guarantees completion).
-            let mut pending = self.pending_sends.lock().expect("pending_sends poisoned");
-            while let Some(front) = pending.front() {
-                if front.wr_id <= wr_id {
-                    pending.pop_front();
-                } else {
-                    break;
+            if let Err(e) = guard.post() {
+                let mut pending = self
+                    .pending_sends
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(pos) = pending.iter().position(|p| p.wr_id == wr_id) {
+                    pending.remove(pos);
                 }
+                return Err(io::Error::other(e.to_string()));
             }
-            reaper.done = true;
+        }
+
+        // 3. Handle completion for signaled sends
+        if should_signal {
+            self.handle_signaled_completion(wr_id).await?;
         }
 
         Ok(())
@@ -466,7 +461,66 @@ impl Transport for RdmaTransport {
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "receive channel closed"))
     }
 
+    #[inline]
     fn alloc_buf(&self, size: usize) -> BytesMut {
         self.pool.alloc(size)
+    }
+}
+
+impl RdmaTransport {
+    /// Prepare send buffer, preferring slab allocation over dynamic registration.
+    fn prepare_send_buffer(&self, buf: &Bytes, total_len: usize) -> io::Result<(u32, u64, u32, SendKeepalive)> {
+        if let Some(mut chunk) = self.context.slab.alloc(total_len) {
+            let slice = chunk.as_mut_slice();
+            slice[0..4].copy_from_slice(&(buf.len() as u32).to_be_bytes());
+            slice[4..4 + buf.len()].copy_from_slice(buf.as_ref());
+            Ok((
+                chunk.lkey(),
+                chunk.as_ptr() as u64,
+                total_len as u32,
+                SendKeepalive::Slab(chunk),
+            ))
+        } else {
+            let mut framed = BytesMut::with_capacity(total_len);
+            framed.extend_from_slice(&(buf.len() as u32).to_be_bytes());
+            framed.extend_from_slice(buf.as_ref());
+            let mut mr = RdmaMr::register(&self.context, framed)
+                .ok_or_else(|| io::Error::other("failed to register memory"))?;
+            let lkey = mr.lkey();
+            let addr = mr.as_mut_slice().as_ptr() as u64;
+            let len = mr.as_slice().len() as u32;
+            Ok((lkey, addr, len, SendKeepalive::Dynamic(mr)))
+        }
+    }
+
+    /// Handle completion for a signaled send, cleaning up pending sends.
+    async fn handle_signaled_completion(&self, wr_id: u64) -> io::Result<()> {
+        let mut reaper = SignaledSendReaper {
+            poller: Arc::clone(&self.poller),
+            pending_sends: Arc::clone(&self.pending_sends),
+            wr_id,
+            done: false,
+        };
+
+        PostSendGuard {
+            poller: &self.poller,
+            wr_id,
+        }
+        .wait()
+        .await?;
+
+        // Clean up all pending sends up to (and including) this wr_id
+        // (RC ordering guarantees earlier sends have completed)
+        let mut pending = self.pending_sends.lock().expect("pending_sends poisoned");
+        while let Some(front) = pending.front() {
+            if front.wr_id <= wr_id {
+                pending.pop_front();
+            } else {
+                break;
+            }
+        }
+        reaper.done = true;
+
+        Ok(())
     }
 }
