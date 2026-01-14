@@ -2,21 +2,38 @@
 name = "net-rs"
 version = "0.1.0"
 edition = "2021"
+description = "A high-performance, abstracted network layer supporting TCP and RDMA"
 
 [features]
-default = []
-rdma = ["dep:sideway", "dep:crossbeam", "dep:dashmap"]
+default = ["rdma"]
+rdma = ["sideway", "rdma-mummy-sys"]
 
 [dependencies]
-tokio = { version = "1.36", features = ["full"] }
-bytes = "1.5"
-thiserror = "1.0"
+# Async runtime
+monoio = { version = "0.2", features = ["iouring", "async-cancel", "sync"] }
 async-trait = "0.1"
-tracing = "0.1"
-futures = "0.3"
+flume = "0.12"
+
+# Byte handling
+bytes = { version = "1", features = ["serde"] }
+
+# Lock-free data structures
+crossbeam = "0.8"
+dashmap = "6"
+
+# Low-level FFI
+libc = "0.2"
+
+# RDMA (optional)
 sideway = { version = "0.4", optional = true }
-crossbeam = { version = "0.8", optional = true }
-dashmap = { version = "5.5", optional = true }
+rdma-mummy-sys = { version = "0.2", optional = true }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+rustc-hash = "2"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"

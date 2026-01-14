@@ -1,92 +1,72 @@
 //! Send path helpers and supporting types.
 
-use super::completion::wait_for_completion_owned;
-use super::protocol::encode_credit_imm;
-use super::types::PendingSend;
-use crate::drivers::rdma::poller::RdmaPoller;
-use sideway::ibverbs::completion::WorkCompletionStatus;
+use super::protocol::{encode_credit_imm, MSG_HEADER_SIZE};
+use super::types::SendKeepalive;
+use crate::drivers::rdma::buffer::RdmaMr;
+use crate::drivers::rdma::context::RdmaContext;
+use bytes::{Bytes, BytesMut};
 use sideway::ibverbs::queue_pair::{GenericQueuePair, QueuePair, PostSendGuard as _, WorkRequestFlags};
-use std::collections::VecDeque;
 use std::io;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::runtime::Handle;
-use tokio::sync::Mutex;
-use tracing::debug;
-
-/// Guard for a posted send operation that provides completion waiting.
-pub(crate) struct PostSendGuard<'a> {
-    pub poller: &'a Arc<RdmaPoller>,
-    pub wr_id: u64,
-}
-
-impl<'a> PostSendGuard<'a> {
-    pub async fn wait(self) -> io::Result<()> {
-        // Poll for completion
-        let c = wait_for_completion_owned(Arc::clone(self.poller), self.wr_id).await?;
-        if c.status != WorkCompletionStatus::Success {
-            return Err(io::Error::other(format!(
-                "RDMA send failed: status={:?} opcode={:?}",
-                c.status, c.opcode
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// Ensures a signaled send's keepalive is eventually released even if the caller cancels the send future.
-pub(crate) struct SignaledSendReaper {
-    pub poller: Arc<RdmaPoller>,
-    pub pending_sends: Arc<StdMutex<VecDeque<PendingSend>>>,
-    pub wr_id: u64,
-    pub done: bool,
-}
-
-impl Drop for SignaledSendReaper {
-    fn drop(&mut self) {
-        if self.done {
-            return;
-        }
-        // Best-effort: if we are running inside a Tokio runtime, detach a task that waits for the
-        // completion and cleans pending sends up to (and including) this wr_id.
-        let Ok(handle) = Handle::try_current() else {
-            // No runtime available; keepalive remains in pending_sends until the transport is dropped.
-            return;
-        };
-
-        let poller = Arc::clone(&self.poller);
-        let pending_sends = Arc::clone(&self.pending_sends);
-        let wr_id = self.wr_id;
-
-        handle.spawn(async move {
-            // Wait for completion (or cancellation of the runtime); on completion, clean up.
-            let _ = wait_for_completion_owned(poller, wr_id).await;
-            let mut pending = pending_sends.lock().expect("pending_sends poisoned");
-            while let Some(front) = pending.front() {
-                if front.wr_id <= wr_id {
-                    pending.pop_front();
-                } else {
-                    break;
-                }
-            }
-        });
-    }
-}
+use std::sync::Arc;
+use std::cell::{Cell, RefCell};
+use tracing::{debug, warn};
 
 /// Send a credit ACK to restore sender's credits.
 pub(crate) async fn send_credit_ack(
-    qp: &Arc<Mutex<GenericQueuePair>>,
-    next_wr_id: &Arc<AtomicU64>,
+    qp: &RefCell<GenericQueuePair>,
+    next_wr_id: &Cell<u64>,
     credits: u32,
 ) -> io::Result<()> {
-    let ack_wr_id = next_wr_id.fetch_add(1, Ordering::Relaxed);
+    let ack_wr_id = {
+        let id = next_wr_id.get();
+        next_wr_id.set(id.wrapping_add(1));
+        id
+    };
 
-    let mut qp_guard = qp.lock().await;
-    let mut guard = qp_guard.start_post_send();
-    let wr = guard.construct_wr(ack_wr_id, WorkRequestFlags::Signaled);
-    wr.setup_send_imm(encode_credit_imm(credits));
-    guard.post().map_err(|e| io::Error::other(e.to_string()))?;
+    // Synchronous borrow (safe as we don't await while holding it, except for the post which is sync)
+    {
+        let mut qp_guard = qp.borrow_mut();
+        let mut guard = qp_guard.start_post_send();
+        let wr = guard.construct_wr(ack_wr_id, WorkRequestFlags::Signaled);
+        wr.setup_send_imm(encode_credit_imm(credits));
+        guard.post().map_err(|e| io::Error::other(e.to_string()))?;
+    }
 
     debug!("sent credit ACK: {} credits", credits);
     Ok(())
+}
+
+/// Prepare send buffer, preferring slab allocation over dynamic registration.
+pub(crate) fn prepare_send_buffer(
+    context: &Arc<RdmaContext>,
+    buf: &Bytes,
+    total_len: usize,
+) -> io::Result<(u32, u64, u32, SendKeepalive)> {
+    if let Some(mut chunk) = context.slab.alloc(total_len) {
+        let slice = chunk.as_mut_slice();
+        slice[0..MSG_HEADER_SIZE].copy_from_slice(&(buf.len() as u32).to_be_bytes());
+        slice[MSG_HEADER_SIZE..MSG_HEADER_SIZE + buf.len()].copy_from_slice(buf.as_ref());
+        Ok((
+            chunk.lkey(),
+            chunk.as_ptr() as u64,
+            total_len as u32,
+            SendKeepalive::Slab(chunk),
+        ))
+    } else {
+        // Slow path: slab exhausted, falling back to dynamic registration.
+        // This is expensive (syscall + TLB flush) and should be monitored.
+        warn!(
+            total_len,
+            "slab allocator exhausted, falling back to slow dynamic memory registration"
+        );
+        let mut framed = BytesMut::with_capacity(total_len);
+        framed.extend_from_slice(&(buf.len() as u32).to_be_bytes());
+        framed.extend_from_slice(buf.as_ref());
+        let mut mr = RdmaMr::register(context, framed)
+            .ok_or_else(|| io::Error::other("failed to register memory"))?;
+        let lkey = mr.lkey();
+        let addr = mr.as_mut_slice().as_ptr() as u64;
+        let len = mr.as_slice().len() as u32;
+        Ok((lkey, addr, len, SendKeepalive::Dynamic(mr)))
+    }
 }

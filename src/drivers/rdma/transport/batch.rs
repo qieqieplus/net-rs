@@ -94,17 +94,13 @@ impl RdmaTransport {
         }
 
         // Acquire permits for all operations
-        let _permit = self
-            .rdma_semaphore
-            .acquire_many(ops.len() as u32)
-            .await
-            .map_err(|_| io::Error::other("RDMA semaphore closed"))?;
+        self.rdma_semaphore.acquire_many(ops.len() as u32).await;
 
         let final_wr_id = self.alloc_wr_id();
         let mut total_bytes: u64 = 0;
 
         {
-            let mut qp_guard = self.qp.lock().await;
+            let mut qp_guard = self.inner.qp.borrow_mut();
             let mut guard = qp_guard.start_post_send();
 
             for (i, op) in ops.iter().enumerate() {
@@ -132,6 +128,8 @@ impl RdmaTransport {
             if let Err(e) = guard.post() {
                 warn!("RDMA write batch post failed, transitioning QP to Error: {}", e);
                 self.force_qp_error_internal(&mut qp_guard);
+                // Release acquired permits before returning error.
+                self.rdma_semaphore.release(ops.len());
                 return Err(io::Error::other(format!("RDMA write batch post failed: {}", e)));
             }
         }
@@ -186,17 +184,13 @@ impl RdmaTransport {
         }
 
         // Acquire permits for all operations
-        let _permit = self
-            .rdma_semaphore
-            .acquire_many(ops.len() as u32)
-            .await
-            .map_err(|_| io::Error::other("RDMA semaphore closed"))?;
+        self.rdma_semaphore.acquire_many(ops.len() as u32).await;
 
         let final_wr_id = self.alloc_wr_id();
         let mut total_bytes: u64 = 0;
 
         {
-            let mut qp_guard = self.qp.lock().await;
+            let mut qp_guard = self.inner.qp.borrow_mut();
             let mut guard = qp_guard.start_post_send();
             let num_ops = ops.len();
 
@@ -226,6 +220,8 @@ impl RdmaTransport {
             if let Err(e) = guard.post() {
                 warn!("RDMA read batch post failed, transitioning QP to Error: {}", e);
                 self.force_qp_error_internal(&mut qp_guard);
+                // Release acquired permits before returning error.
+                self.rdma_semaphore.release(ops.len());
                 return Err(io::Error::other(format!("RDMA read batch post failed: {}", e)));
             }
         }

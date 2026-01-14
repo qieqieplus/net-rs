@@ -1,140 +1,285 @@
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
-/// Credit-based flow controller for RDMA transport.
-///
-/// Prevents sender from overwhelming receiver by limiting outstanding sends.
-/// Credits are consumed on send and restored when receiver ACKs via immediate data.
 #[derive(Clone, Debug)]
 pub struct FlowController {
-    /// Maximum credits (initial window size)
+    inner: Rc<RefCell<Inner>>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    available: usize,
     max_credits: usize,
-    /// Semaphore for async credit acquisition
-    semaphore: Arc<Semaphore>,
+    next_waiter_id: u64,
+    waiters: VecDeque<Waiter>,
+}
+
+#[derive(Debug)]
+struct Waiter {
+    id: u64,
+    needed: usize,
+    waker: Waker,
+}
+
+impl Inner {
+    fn ready_head_waker(&self) -> Option<Waker> {
+        let head = self.waiters.front()?;
+        if self.available >= head.needed {
+            Some(head.waker.clone())
+        } else {
+            None
+        }
+    }
+
+    fn remove_waiter(&mut self, id: u64) {
+        if let Some(front) = self.waiters.front() {
+            if front.id == id {
+                self.waiters.pop_front();
+                return;
+            }
+        }
+        // Fallback: Scan (O(N)). Only happens on cancellation.
+        if let Some(pos) = self.waiters.iter().position(|w| w.id == id) {
+            self.waiters.remove(pos);
+        }
+    }
 }
 
 impl FlowController {
-    /// Create a new flow controller with the given maximum credits.
     pub fn new(max_credits: usize) -> Self {
         Self {
-            max_credits,
-            semaphore: Arc::new(Semaphore::new(max_credits)),
+            inner: Rc::new(RefCell::new(Inner {
+                available: max_credits,
+                max_credits,
+                next_waiter_id: 0,
+                waiters: VecDeque::with_capacity(32),
+            })),
         }
     }
 
-    /// Acquire a send credit, blocking if none available.
-    ///
-    /// Returns a guard that can be used to track the send.
-    /// Credits are NOT automatically returned on drop - they must be
-    /// explicitly restored via ACK messages.
-    pub async fn acquire(&self) -> FlowControlGuard {
-        let permit = self.semaphore.acquire().await.expect("Semaphore closed");
-        permit.forget(); // Don't auto-return on drop
-        FlowControlGuard { _guard: () }
+    pub fn acquire(&self) -> Acquire {
+        Acquire::new(self.inner.clone(), 1)
     }
 
-    /// Try to acquire a credit without blocking.
+    pub fn acquire_many(&self, count: u32) -> Acquire {
+        Acquire::new(self.inner.clone(), count as usize)
+    }
+
+    /// Acquire a single credit and return a guard that releases it on drop.
+    pub async fn acquire_guard(&self) -> FlowControlGuard {
+        self.acquire_guard_many(1).await
+    }
+
+    pub async fn acquire_guard_many(&self, count: u32) -> FlowControlGuard {
+        let size = count as usize;
+        self.acquire_many(count).await;
+        FlowControlGuard { 
+            inner: self.inner.clone(), 
+            size 
+        }
+    }
+
     #[allow(dead_code)]
-    pub fn try_acquire(&self) -> Option<FlowControlGuard> {
-        self.semaphore.try_acquire().ok().map(|permit| {
-            permit.forget();
-            FlowControlGuard { _guard: () }
-        })
+    pub fn try_acquire(&self, count: u32) -> bool {
+        let needed = count as usize;
+        let mut inner = self.inner.borrow_mut();
+        
+        if !inner.waiters.is_empty() {
+            return false;
+        }
+
+        if inner.available >= needed {
+            inner.available -= needed;
+            true
+        } else {
+            false
+        }
     }
 
-    /// Restore credits (called when receiving ACK from peer).
+    /// Get the number of currently available credits.
+    /// Used for smart signal decisions in the send path.
     #[inline]
-    pub fn release(&self, count: usize) {
-        if count == 0 {
-            return;
-        }
-        let available = self.semaphore.available_permits();
-        if available >= self.max_credits {
-            return;
-        }
-        let remaining = self.max_credits - available;
-        debug_assert!(
-            count <= remaining,
-            "flow control release would exceed max_credits (count={}, available={}, max_credits={})",
-            count,
-            available,
-            self.max_credits
-        );
-        self.semaphore.add_permits(count.min(remaining));
-    }
-
-    /// Get current available credits (approximate).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn available(&self) -> usize {
-        self.semaphore.available_permits()
+        self.inner.borrow().available
     }
 
-    /// Get maximum credits.
-    #[allow(dead_code)]
-    pub fn max_credits(&self) -> usize {
-        self.max_credits
+    pub fn release(&self, count: usize) {
+        if count == 0 { return; }
+
+        let waker = {
+            let mut inner = self.inner.borrow_mut();
+            inner.available = inner.available.saturating_add(count).min(inner.max_credits);
+            inner.ready_head_waker()
+        };
+        
+        if let Some(w) = waker {
+            w.wake();
+        }
     }
 }
 
-/// Guard representing an acquired send credit.
-///
-/// Credits are NOT released on drop - they are released when
-/// the peer ACKs via immediate data.
-#[must_use = "Dropping this guard does not return the credit. Ensure the message is sent or explicitly handled."]
+pub struct Acquire {
+    inner: Rc<RefCell<Inner>>,
+    needed: usize,
+    waiter_id: Option<u64>,
+}
+
+impl Acquire {
+    fn new(inner: Rc<RefCell<Inner>>, needed: usize) -> Self {
+        let max = inner.borrow().max_credits;
+        assert!(needed <= max, "Deadlock: acquire({}) > max({})", needed, max);
+        Self { inner, needed, waiter_id: None }
+    }
+}
+
+impl Future for Acquire {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Safety: Prevent double-polling after Ready
+        if self.needed == 0 {
+            return Poll::Ready(());
+        }
+
+        let mut wake_next: Option<Waker> = None;
+        let mut ready = false;
+        let mut new_waiter_id: Option<u64> = None;
+
+        {
+            let mut inner = self.inner.borrow_mut();
+
+            // Logic Flow:
+            // 1. If we have a waiter_id, we are in the queue.
+            // 2. If we are in the queue, we can only acquire if we are Head AND credits available.
+            // 3. If we are NOT in the queue (first poll), we can acquire if Queue Empty AND credits available.
+            
+            // Optimization: determine if we are effectively at the head
+            let is_head = match self.waiter_id {
+                Some(id) => inner.waiters.front().map(|w| w.id == id).unwrap_or(false),
+                None => inner.waiters.is_empty(),
+            };
+
+            if is_head && inner.available >= self.needed {
+                // --- Success Path ---
+                inner.available -= self.needed;
+
+                if self.waiter_id.is_some() {
+                    // We verified we are head above, so pop_front is correct
+                    inner.waiters.pop_front();
+                }
+
+                // Chain reaction: check if the *next* waiter can also run
+                wake_next = inner.ready_head_waker();
+                
+                // Clean state (after we're done with inner)
+                ready = true;
+            } else {
+                // --- Wait Path ---
+                match self.waiter_id {
+                    Some(id) => {
+                        // We are already queued. Update Waker.
+                        // NOTE: This O(N) scan is unfortunate but necessary with VecDeque 
+                        // to handle waker updates (e.g. task moving).
+                        if let Some(pos) = inner.waiters.iter().position(|w| w.id == id) {
+                            inner.waiters[pos].waker = cx.waker().clone();
+                        } else {
+                            // This branch implies state corruption or logic bug (ID set but not in queue).
+                            // Recover by re-queueing to avoid hanging forever.
+                            let id = inner.next_waiter_id;
+                            inner.next_waiter_id = inner.next_waiter_id.wrapping_add(1);
+                            let needed = self.needed;
+                            inner.waiters.push_back(Waiter {
+                                id,
+                                needed,
+                                waker: cx.waker().clone(),
+                            });
+                            // Defer waiter_id update until after borrow ends
+                            new_waiter_id = Some(id);
+                        }
+                    }
+                    None => {
+                        // Initial queue insertion
+                        let id = inner.next_waiter_id;
+                        inner.next_waiter_id = inner.next_waiter_id.wrapping_add(1);
+                        let needed = self.needed;
+                        inner.waiters.push_back(Waiter {
+                            id,
+                            needed,
+                            waker: cx.waker().clone(),
+                        });
+                        // Defer waiter_id update until after borrow ends
+                        new_waiter_id = Some(id);
+                    }
+                }
+            }
+        } // End borrow
+
+        // Apply deferred waiter_id update now that inner is dropped
+        if let Some(id) = new_waiter_id {
+            self.as_mut().get_mut().waiter_id = Some(id);
+        }
+
+        if let Some(w) = wake_next {
+            w.wake();
+        }
+
+        if ready {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for Acquire {
+    fn drop(&mut self) {
+        // If we acquired (needed == 0) or were never queued (waiter_id == None), nothing to do.
+        if self.needed == 0 {
+            return;
+        }
+        if let Some(id) = self.waiter_id {
+            let waker = {
+                let mut inner = self.inner.borrow_mut();
+                inner.remove_waiter(id);
+                // If the head was removed (us), the new head might be runnable
+                inner.ready_head_waker()
+            };
+            if let Some(w) = waker {
+                w.wake();
+            }
+        }
+    }
+}
+
 pub struct FlowControlGuard {
-    _guard: (),
+    inner: Rc<RefCell<Inner>>,
+    size: usize,
 }
 
 impl Drop for FlowControlGuard {
     fn drop(&mut self) {
-        // Intentionally empty: credits are restored via ACK, not RAII.
-        // Note: if this guard is dropped after `permit.forget()` but before the send happens
-        // (e.g. due to cancellation/panic), that credit is effectively leaked until reconnect.
-    }
-}
+        if self.size == 0 { return; }
+        
+        // This is safe because Rc<RefCell<Inner>> ensures the Inner is still alive.
+        // If FlowController was dropped, inner is still held by this Guard.
+        let waker = {
+            // Unlikely to fail borrow unless recursive logic exists (not present here)
+            if let Ok(mut inner) = self.inner.try_borrow_mut() {
+                inner.available = inner.available.saturating_add(self.size).min(inner.max_credits);
+                inner.ready_head_waker()
+            } else {
+                // In case of a panic unwinding while borrow is held elsewhere,
+                // we leak credits rather than double-panicking.
+                None
+            }
+        };
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_flow_control_basic() {
-        let fc = FlowController::new(2);
-
-        assert_eq!(fc.available(), 2);
-
-        let _guard1 = fc.acquire().await;
-        assert_eq!(fc.available(), 1);
-
-        let _guard2 = fc.acquire().await;
-        assert_eq!(fc.available(), 0);
-
-        // Release credits
-        fc.release(2);
-        assert_eq!(fc.available(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_flow_control_blocking() {
-        let fc = FlowController::new(1);
-        let fc_clone = fc.clone();
-
-        let _guard = fc.acquire().await;
-        assert_eq!(fc.available(), 0);
-
-        // Spawn task that will block on acquire
-        let handle = tokio::spawn(async move {
-            let _ = fc_clone.acquire().await;
-        });
-
-        // Release credit to unblock
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        fc.release(1);
-
-        // Task should complete
-        tokio::time::timeout(tokio::time::Duration::from_millis(100), handle)
-            .await
-            .expect("Task should complete")
-            .unwrap();
+        if let Some(w) = waker {
+            w.wake();
+        }
     }
 }

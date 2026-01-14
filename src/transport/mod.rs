@@ -6,15 +6,15 @@ use std::io;
 /// 
 /// In TCP, this just allocates heap memory.
 /// In RDMA, this allocates from a registered memory region (MR).
-pub trait BufferPool: Send + Sync + 'static {
+pub trait BufferPool: 'static {
     fn alloc(&self, size: usize) -> BytesMut;
 }
 
 /// A generic transport that can send and receive data.
 /// 
 /// This abstracts over a TCP Stream or an RDMA Queue Pair.
-#[async_trait]
-pub trait Transport: Send + Sync + 'static {
+#[async_trait(?Send)]
+pub trait Transport: 'static {
     /// Send a buffer to the peer.
     /// 
     /// The buffer should ideally be allocated via `alloc_buf` to support zero-copy on RDMA.

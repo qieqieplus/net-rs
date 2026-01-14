@@ -47,6 +47,13 @@ impl RdmaTransport {
     /// Writes the local data to the remote memory region using one-sided RDMA.
     /// This is a zero-copy operation that does not involve the remote CPU.
     ///
+    /// # Performance Warning
+    ///
+    /// **This method performs memory registration (`ibv_reg_mr`) on every call**, which is
+    /// an expensive syscall involving page pinning and kernel interaction. For hot-path
+    /// performance, prefer [`rdma_write_mr`](Self::rdma_write_mr) with pre-registered
+    /// memory regions.
+    ///
     /// # Arguments
     /// * `remote` - Remote buffer descriptor (address, length, rkey)
     /// * `local` - Local data to write
@@ -67,6 +74,13 @@ impl RdmaTransport {
     ///
     /// Reads data from the remote memory region into the local buffer using one-sided RDMA.
     /// This is a zero-copy operation that does not involve the remote CPU.
+    ///
+    /// # Performance Warning
+    ///
+    /// **This method performs memory registration (`ibv_reg_mr`) and an extra copy on every call.**
+    /// Registration is an expensive syscall, and the final copy from the registered scratch buffer
+    /// to the destination adds CPU overhead. For hot-path performance, prefer
+    /// [`rdma_read_mr`](Self::rdma_read_mr) with pre-registered memory regions.
     ///
     /// # Arguments
     /// * `remote` - Remote buffer descriptor (address, length, rkey)
@@ -98,14 +112,10 @@ impl RdmaTransport {
         let local_addr = local.as_slice().as_ptr() as u64;
         let len = local.as_slice().len() as u32;
 
-        let _permit = self
-            .rdma_semaphore
-            .acquire()
-            .await
-            .expect("Semaphore closed");
+        let _permit = self.rdma_semaphore.acquire_guard().await;
         let wr_id = self.alloc_wr_id();
         {
-            let mut qp_guard = self.qp.lock().await;
+            let mut qp_guard = self.inner.qp.borrow_mut();
             let mut guard = qp_guard.start_post_send();
             let wr = guard.construct_wr(wr_id, WorkRequestFlags::Signaled);
             unsafe {
@@ -135,14 +145,10 @@ impl RdmaTransport {
         let local_addr = local.as_mut_slice().as_ptr() as u64;
         let len = local.as_slice().len() as u32;
 
-        let _permit = self
-            .rdma_semaphore
-            .acquire()
-            .await
-            .expect("Semaphore closed");
+        let _permit = self.rdma_semaphore.acquire_guard().await;
         let wr_id = self.alloc_wr_id();
         {
-            let mut qp_guard = self.qp.lock().await;
+            let mut qp_guard = self.inner.qp.borrow_mut();
             let mut guard = qp_guard.start_post_send();
             let wr = guard.construct_wr(wr_id, WorkRequestFlags::Signaled);
             unsafe {
@@ -162,3 +168,4 @@ impl RdmaTransport {
         Ok(())
     }
 }
+

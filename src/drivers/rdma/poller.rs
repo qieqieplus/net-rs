@@ -1,212 +1,324 @@
-use sideway::ibverbs::completion::{GenericCompletionQueue, PollCompletionQueueError, WorkCompletionStatus};
-use sideway::ibverbs::completion::WorkCompletionOperationType;
-use crossbeam::channel::{unbounded, Sender};
-use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+//! Integrated RDMA Completion Queue Poller.
+//!
+//! This module provides an async-friendly CQ poller that integrates with
+//! Monoio's io_uring event loop. Instead of using a dedicated polling thread,
+//! it uses a `CompletionChannel` FD registered with io_uring for event notification.
+//!
+//! # Flow
+//! 1. Create CQ with CompletionChannel
+//! 2. Arm CQ for solicited notifications via `ibv_req_notify_cq`
+//! 3. Wait for channel FD to be readable (io_uring)
+//! 4. Read events via `ibv_get_cq_event` / `ibv_ack_cq_events`
+//! 5. Poll CQ work completions
+//! 6. Re-arm and repeat
+
+use std::cell::RefCell;
+use rustc_hash::FxHashMap;
+use std::io;
+use std::os::fd::{AsRawFd, RawFd};
+use std::ptr;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::task::Waker;
-use std::thread;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedSender;
-use tracing::error;
 
-#[derive(Debug)]
-enum PollerCmd {
-    Register { wr_id: u64, waker: Waker },
-    Cancel { wr_id: u64 },
-}
+use sideway::ibverbs::completion::{
+    CompletionChannel, CompletionQueue, GenericCompletionQueue, PollCompletionQueueError,
+    WorkCompletionOperationType, WorkCompletionStatus,
+};
+use tracing::{debug, error};
 
+/// Completion result from an RDMA operation.
 #[derive(Debug, Clone, Copy)]
 pub struct Completion {
     pub status: WorkCompletionStatus,
     pub opcode: WorkCompletionOperationType,
     pub byte_len: u32,
-    /// Immediate data associated with this completion (valid for *WithImmediate opcodes).
     pub imm_data: Option<u32>,
 }
 
+/// A completion event with its work request ID.
 #[derive(Debug, Clone, Copy)]
 pub struct CompletionEvent {
     pub wr_id: u64,
     pub completion: Completion,
 }
 
-#[allow(dead_code)]
-pub struct RdmaPoller {
-    cq: GenericCompletionQueue,
-    cmd_tx: Sender<PollerCmd>,
-    completions: Arc<DashMap<u64, Completion>>,
-    shutdown: Arc<AtomicBool>,
-    recv_tx: Option<UnboundedSender<CompletionEvent>>,
-    join_handle: Option<std::thread::JoinHandle<()>>,
+/// Pending wait state for an RDMA operation.
+struct PendingWait {
+    waker: Option<std::task::Waker>,
+    completion: Option<Completion>,
 }
 
-unsafe impl Send for RdmaPoller {}
-unsafe impl Sync for RdmaPoller {}
+/// Integrated RDMA Completion Queue Poller.
+///
+/// Uses io_uring to wait for CQ events, eliminating the need for a dedicated
+/// polling thread. All RDMA completions are processed on the Monoio reactor thread.
+pub struct RdmaPoller {
+    /// The completion queue being polled.
+    cq: GenericCompletionQueue,
+    /// Completion channel for event notifications.
+    channel: Arc<CompletionChannel>,
+    /// Pending waits indexed by work request ID.
+    pending: Rc<RefCell<FxHashMap<u64, PendingWait>>>,
+    /// Error token bucket for rate-limited logging.
+    err_tokens: RefCell<u32>,
+}
 
 impl RdmaPoller {
-    pub fn new(cq: GenericCompletionQueue) -> Self {
-        Self::new_with_recv(cq, None)
-    }
-
-    pub fn new_with_recv(cq: GenericCompletionQueue, recv_tx: Option<UnboundedSender<CompletionEvent>>) -> Self {
-        let (cmd_tx, cmd_rx) = unbounded::<PollerCmd>();
-        let completions = Arc::new(DashMap::<u64, Completion>::new());
-        let shutdown = Arc::new(AtomicBool::new(false));
-        
-        let cq_clone = cq.clone();
-        let completions_clone = Arc::clone(&completions);
-        let shutdown_clone = shutdown.clone();
-        let recv_tx_clone = recv_tx.clone();
-
-        let join_handle = thread::spawn(move || {
-            let mut wakers: HashMap<u64, Waker> = HashMap::new();
-            let mut canceled: HashSet<u64> = HashSet::new();
-            let mut idle_count: u32 = 0;
-            let mut last_err_log = Instant::now();
-            let mut err_suppressed: u64 = 0;
-
-            while !shutdown_clone.load(Ordering::Relaxed) {
-                // Drain registration/cancellation commands (non-blocking).
-                while let Ok(cmd) = cmd_rx.try_recv() {
-                    match cmd {
-                        PollerCmd::Register { wr_id, waker } => {
-                            // Refresh the waker (it may change between polls).
-                            wakers.insert(wr_id, waker);
-                            // If we previously saw a cancel for this wr_id, drop it: wr_ids are
-                            // expected to be unique for in-flight requests; repeated Register calls
-                            // are normal as the future is polled.
-                            canceled.remove(&wr_id);
-                        }
-                        PollerCmd::Cancel { wr_id } => {
-                            wakers.remove(&wr_id);
-                            // If the completion already arrived, drop it now and do NOT record the
-                            // cancellation (there will be no future completion to consume it).
-                            let had_completion = completions_clone.remove(&wr_id).is_some();
-                            if !had_completion {
-                                canceled.insert(wr_id);
-                            }
-                        }
-                    }
-                }
-
-                // Poll CQ (Sideway's start_poll returns an iterator)
-                match cq_clone.start_poll() {
-                    Ok(poller) => {
-                         let mut count = 0;
-                         for completion in poller {
-                             count += 1;
-                             idle_count = 0;
-                             let status = WorkCompletionStatus::from(completion.status());
-                             let opcode = WorkCompletionOperationType::from(completion.opcode());
-                             let byte_len = completion.byte_len();
-                             let wr_id = completion.wr_id();
-
-                             if status != WorkCompletionStatus::Success {
-                                 // Avoid blocking I/O in the hot path; rate-limit error logging.
-                                 if last_err_log.elapsed() >= Duration::from_secs(1) {
-                                     if err_suppressed > 0 {
-                                         error!("RDMA WC Error: suppressed {} errors in the last 1s", err_suppressed);
-                                     }
-                                     err_suppressed = 0;
-                                     last_err_log = Instant::now();
-                                 }
-                                 if err_suppressed < 16 {
-                                     error!("RDMA WC Error: status={:?} opcode={:?} wr_id={}", status, opcode, wr_id);
-                                 } else {
-                                     err_suppressed += 1;
-                                 }
-                             }
-
-                             let imm_data = match opcode {
-                                 WorkCompletionOperationType::ReceiveWithImmediate => Some(completion.imm_data()),
-                                 _ => None,
-                             };
-                             let c = Completion {
-                                 status,
-                                 opcode,
-                                 byte_len,
-                                 imm_data,
-                             };
-
-                             // Fast-path receive completions to a dedicated consumer (if configured)
-                             if matches!(opcode, WorkCompletionOperationType::Receive | WorkCompletionOperationType::ReceiveWithImmediate) {
-                                 if let Some(tx) = &recv_tx_clone {
-                                     let _ = tx.send(CompletionEvent { wr_id, completion: c });
-                                 } else {
-                                     completions_clone.insert(wr_id, c);
-                                 }
-                                 continue;
-                             }
-
-                             // If the waiter was cancelled, drop the completion and clear the mark.
-                             if canceled.remove(&wr_id) {
-                                 continue;
-                             }
-
-                             // Otherwise, store completion and wake any waiter.
-                             completions_clone.insert(wr_id, c);
-                             if let Some(waker) = wakers.remove(&wr_id) {
-                                 waker.wake();
-                             }
-                         }
-                         if count == 0 {
-                             idle_count = idle_count.saturating_add(1);
-                         }
-                    }
-                    Err(PollCompletionQueueError::CompletionQueueEmpty) => {
-                        idle_count = idle_count.saturating_add(1);
-                    }
-                    Err(e) => {
-                        // Not expected in the hot path; still avoid stdout/stderr.
-                        error!("Failed to start poll: {:?}", e);
-                        idle_count = idle_count.saturating_add(1);
-                    }
-                }
-
-                // Adaptive idle strategy: busy-poll briefly, then yield, then sleep.
-                if idle_count > 100 {
-                    thread::sleep(Duration::from_micros(10));
-                } else if idle_count > 10 {
-                    thread::yield_now();
-                }
-            }
-        });
-
+    /// Creates a new poller for the given CQ and channel.
+    ///
+    /// The CQ must have been created with this channel for event notification.
+    pub fn new(cq: GenericCompletionQueue, channel: Arc<CompletionChannel>) -> Self {
         Self {
             cq,
-            cmd_tx,
-            completions,
-            shutdown,
-            recv_tx,
-            join_handle: Some(join_handle),
+            channel,
+            pending: Rc::new(RefCell::new(FxHashMap::default())),
+            err_tokens: RefCell::new(10),
         }
     }
 
-    pub fn register(&self, wr_id: u64, waker: Waker) {
-        // Best-effort; if poller thread is gone we just stop waking.
-        let _ = self.cmd_tx.send(PollerCmd::Register { wr_id, waker });
+    /// Get the raw FD of the completion channel for io_uring registration.
+    pub fn channel_fd(&self) -> RawFd {
+        self.channel.as_raw_fd()
     }
 
-    /// Best-effort cancellation for an in-flight `wr_id`.
+    /// Arm the CQ for solicited completions.
     ///
-    /// This is primarily used to prevent unbounded growth if the waiting future is dropped
-    /// (timeout/cancellation). It does **not** cancel the underlying RDMA operation.
-    pub fn cancel(&self, wr_id: u64) {
-        let _ = self.cmd_tx.send(PollerCmd::Cancel { wr_id });
+    /// Must be called before waiting on the channel FD.
+    /// Returns an error if arming fails.
+    pub fn arm(&self) -> io::Result<()> {
+        // SAFETY: We have valid pointers to ibv_cq from the CQ.
+        unsafe {
+            let cq_ptr = match &self.cq {
+                GenericCompletionQueue::Basic(bcq) => bcq.cq().as_ptr(),
+                GenericCompletionQueue::Extended(ecq) => ecq.cq().as_ptr(),
+            };
+            // Request solicited notification (second arg = 0 means solicited only)
+            let ret = rdma_mummy_sys::ibv_req_notify_cq(cq_ptr, 0);
+            if ret != 0 {
+                return Err(io::Error::from_raw_os_error(-ret));
+            }
+        }
+        Ok(())
     }
 
-    pub fn take_completion(&self, wr_id: u64) -> Option<Completion> {
-        self.completions.remove(&wr_id).map(|(_, c)| c)
+    /// Acknowledge CQ events after reading from the channel.
+    ///
+    /// Must be called after `ibv_get_cq_event` to prevent event queue overflow.
+    pub fn ack_events(&self, count: u32) {
+        if count == 0 {
+            return;
+        }
+        // SAFETY: Valid CQ pointer.
+        unsafe {
+            let cq_ptr = match &self.cq {
+                GenericCompletionQueue::Basic(bcq) => bcq.cq().as_ptr(),
+                GenericCompletionQueue::Extended(ecq) => ecq.cq().as_ptr(),
+            };
+            rdma_mummy_sys::ibv_ack_cq_events(cq_ptr, count);
+        }
+    }
+
+    /// Wait for and consume a CQ event from the completion channel.
+    ///
+    /// Returns `true` if an event was received, `false` on channel error.
+    /// This is a blocking call in ibverbs but we wrap it with async FD polling.
+    pub fn get_cq_event(&self) -> io::Result<bool> {
+        // SAFETY: Valid channel and CQ pointers.
+        unsafe {
+            let channel_ptr = self.channel.comp_channel().as_ptr();
+            let mut cq_ptr: *mut rdma_mummy_sys::ibv_cq = ptr::null_mut();
+            let mut cq_ctx: *mut std::ffi::c_void = ptr::null_mut();
+
+            let ret = rdma_mummy_sys::ibv_get_cq_event(channel_ptr, &mut cq_ptr, &mut cq_ctx);
+            if ret != 0 {
+                // EAGAIN means no event ready (shouldn't happen if FD was readable)
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EAGAIN) {
+                    return Ok(false);
+                }
+                return Err(err);
+            }
+            Ok(true)
+        }
+    }
+
+    /// Poll the CQ and process all available work completions.
+    ///
+    /// This method accepts mutable references to event buffers to avoid allocations.
+    /// Callers should clear the buffers before calling, and this method will append events.
+    ///
+    /// - recv_events: Receive completions that need payload handling
+    /// - send_events: Send/RDMA completions for credit release
+    ///
+    /// Also wakes waiters for send/RDMA completions (for RDMA READ/WRITE futures).
+    pub fn poll_cq(&self, recv_events: &mut Vec<CompletionEvent>, send_events: &mut Vec<CompletionEvent>) {
+        use std::collections::hash_map::Entry;
+
+        let mut err_tokens = self.err_tokens.borrow_mut();
+        // Hoist borrow_mut outside the hot loop to eliminate repeated runtime borrow checks.
+        let mut pending = self.pending.borrow_mut();
+
+        loop {
+            match self.cq.start_poll() {
+                Ok(iter) => {
+                    let mut found_any = false;
+                    for wc in iter {
+                        found_any = true;
+                        let wr_id = wc.wr_id();
+                        let status = WorkCompletionStatus::from(wc.status());
+                        let opcode = WorkCompletionOperationType::from(wc.opcode());
+
+                        // Rate-limited error logging
+                        if status != WorkCompletionStatus::Success {
+                            let is_flush =
+                                matches!(status, WorkCompletionStatus::WorkRequestFlushedError);
+                            if *err_tokens > 0 {
+                                *err_tokens -= 1;
+                                if is_flush {
+                                    debug!("RDMA WC flushed (shutdown): id={} op={:?}", wr_id, opcode);
+                                } else {
+                                    error!(
+                                        "RDMA WC Err: id={} status={:?} op={:?} vendor_err={}",
+                                        wr_id, status, opcode, wc.vendor_err()
+                                    );
+                                }
+                            }
+                        }
+
+                        let completion = Completion {
+                            status,
+                            opcode,
+                            byte_len: wc.byte_len(),
+                            imm_data: if matches!(
+                                opcode,
+                                WorkCompletionOperationType::ReceiveWithImmediate
+                            ) {
+                                Some(wc.imm_data())
+                            } else {
+                                None
+                            },
+                        };
+
+                        // Recv completions are streamed, not awaited
+                        if matches!(
+                            opcode,
+                            WorkCompletionOperationType::Receive
+                                | WorkCompletionOperationType::ReceiveWithImmediate
+                        ) {
+                            recv_events.push(CompletionEvent { wr_id, completion });
+                            continue;
+                        }
+
+                        // Send/RDMA completions: collect for credit release AND wake waiter
+                        send_events.push(CompletionEvent { wr_id, completion });
+
+                        // Use Entry API to avoid double hashing/lookup
+                        match pending.entry(wr_id) {
+                            Entry::Occupied(mut entry) => {
+                                let pw = entry.get_mut();
+                                pw.completion = Some(completion);
+                                if let Some(waker) = pw.waker.take() {
+                                    waker.wake();
+                                }
+                            }
+                            Entry::Vacant(entry) => {
+                                // Store for future waiter (missed wakeup case)
+                                entry.insert(PendingWait {
+                                    waker: None,
+                                    completion: Some(completion),
+                                });
+                            }
+                        }
+                    }
+                    if !found_any {
+                        break;
+                    }
+                }
+                Err(PollCompletionQueueError::CompletionQueueEmpty) => break,
+                Err(e) => {
+                    error!("RDMA CQ poll error: {:?}", e);
+                    break;
+                }
+            }
+        }
+
+        // Refill error token bucket periodically
+        if *err_tokens < 10 {
+            *err_tokens = (*err_tokens).saturating_add(1);
+        }
+    }
+
+    /// Creates a future that waits for a specific work request to complete.
+    pub fn wait(&self, wr_id: u64) -> RdmaOpFuture {
+        RdmaOpFuture {
+            wr_id,
+            pending: Rc::clone(&self.pending),
+            registered: false,
+        }
+    }
+
+    /// Cancel a pending wait.
+    pub fn cancel(&self, wr_id: u64) {
+        self.pending.borrow_mut().remove(&wr_id);
     }
 }
 
-impl Drop for RdmaPoller {
+/// Future that waits for an RDMA operation to complete.
+pub struct RdmaOpFuture {
+    wr_id: u64,
+    pending: Rc<RefCell<FxHashMap<u64, PendingWait>>>,
+    registered: bool,
+}
+
+impl std::future::Future for RdmaOpFuture {
+    type Output = Completion;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let wr_id = self.wr_id;
+        
+        {
+            let mut pending = self.pending.borrow_mut();
+
+            // Check if completion already arrived
+            if let Some(pw) = pending.get_mut(&wr_id) {
+                if let Some(completion) = pw.completion.take() {
+                    pending.remove(&wr_id);
+                    return std::task::Poll::Ready(completion);
+                }
+                // Update waker
+                pw.waker = Some(cx.waker().clone());
+            } else {
+                // Register interest
+                pending.insert(
+                    wr_id,
+                    PendingWait {
+                        waker: Some(cx.waker().clone()),
+                        completion: None,
+                    },
+                );
+            }
+        } // `pending` dropped here
+        
+        self.registered = true;
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for RdmaOpFuture {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
+        if self.registered {
+            // Remove waker but keep completion if it exists (for cleanup)
+            let mut pending = self.pending.borrow_mut();
+            if let Some(pw) = pending.get_mut(&self.wr_id) {
+                pw.waker = None;
+                // If no completion, remove entry entirely
+                if pw.completion.is_none() {
+                    pending.remove(&self.wr_id);
+                }
+            }
         }
     }
 }

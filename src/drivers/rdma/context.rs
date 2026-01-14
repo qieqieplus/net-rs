@@ -5,7 +5,7 @@ use std::io;
 use std::sync::Arc;
 use tracing::warn;
 
-use crate::drivers::rdma::slab_allocator::SlabAllocator;
+use crate::memory::SlabAllocator;
 
 pub struct RdmaContext {
     pub(crate) ctx: Arc<DeviceContext>,

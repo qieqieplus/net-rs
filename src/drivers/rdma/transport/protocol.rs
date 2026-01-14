@@ -5,6 +5,9 @@
 /// Default maximum receive buffer size (1 MiB payload + 4-byte length header).
 pub const DEFAULT_MAX_RECV_BYTES: usize = 1024 * 1024;
 
+/// Size of the message length header in bytes.
+pub const MSG_HEADER_SIZE: usize = 4;
+
 /// Default receive queue depth.
 pub const DEFAULT_RECV_DEPTH: usize = 512;
 

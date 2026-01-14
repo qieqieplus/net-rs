@@ -1,7 +1,7 @@
 //! Internal types used by the RDMA transport.
 
 use crate::drivers::rdma::buffer::RdmaMr;
-use crate::drivers::rdma::slab_allocator::SlabChunk;
+use crate::memory::SlabChunk;
 
 /// Buffer types for keeping send data alive until completion.
 #[allow(dead_code)]

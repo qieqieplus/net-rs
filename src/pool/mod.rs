@@ -1,20 +1,20 @@
 use crate::transport::Transport;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::hash::Hash;
-use std::sync::Arc;
+use std::rc::Rc;
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
 /// A pooled connection wrapper that tracks creation time for expiry.
 pub struct PooledConnection<T: Transport> {
-    inner: Arc<T>,
+    inner: Rc<T>,
     created_at: Instant,
 }
 
 impl<T: Transport> PooledConnection<T> {
     pub fn new(transport: T) -> Self {
         Self {
-            inner: Arc::new(transport),
+            inner: Rc::new(transport),
             created_at: Instant::now(),
         }
     }
@@ -23,7 +23,7 @@ impl<T: Transport> PooledConnection<T> {
         self.created_at.elapsed() > ttl
     }
 
-    pub fn transport(&self) -> &Arc<T> {
+    pub fn transport(&self) -> &Rc<T> {
         &self.inner
     }
 }
@@ -33,30 +33,33 @@ impl<T: Transport> PooledConnection<T> {
 /// Generic over:
 /// - K: Key type (e.g., Address)
 /// - T: Transport type
+/// 
+/// Note: This pool is Thread-Per-Core (single threaded). 
+/// It uses Rc/RefCell and is !Send / !Sync.
 pub struct ConnectionPool<K, T>
 where
     K: Eq + Hash + Clone,
     T: Transport,
 {
-    pool: Arc<RwLock<HashMap<K, PooledConnection<T>>>>,
+    pool: Rc<RefCell<FxHashMap<K, PooledConnection<T>>>>,
     ttl: Duration,
 }
 
 impl<K, T> ConnectionPool<K, T>
 where
-    K: Eq + Hash + Clone + Send + Sync + 'static,
+    K: Eq + Hash + Clone + 'static,
     T: Transport,
 {
     pub fn new(ttl: Duration) -> Self {
         Self {
-            pool: Arc::new(RwLock::new(HashMap::new())),
+            pool: Rc::new(RefCell::new(FxHashMap::default())),
             ttl,
         }
     }
 
     /// Get a connection from the pool, or None if not cached or expired.
-    pub async fn get(&self, key: &K) -> Option<Arc<T>> {
-        let pool = self.pool.read().await;
+    pub async fn get(&self, key: &K) -> Option<Rc<T>> {
+        let pool = self.pool.borrow();
         pool.get(key).and_then(|conn| {
             if conn.is_expired(self.ttl) {
                 None
@@ -67,29 +70,29 @@ where
     }
 
     /// Insert a new connection into the pool.
-    pub async fn insert(&self, key: K, transport: T) -> Arc<T> {
+    pub async fn insert(&self, key: K, transport: T) -> Rc<T> {
         let conn = PooledConnection::new(transport);
-        let arc = conn.transport().clone();
-        let mut pool = self.pool.write().await;
+        let rc = conn.transport().clone();
+        let mut pool = self.pool.borrow_mut();
         pool.insert(key, conn);
-        arc
+        rc
     }
 
     /// Remove a specific connection from the pool.
     pub async fn remove(&self, key: &K) {
-        let mut pool = self.pool.write().await;
+        let mut pool = self.pool.borrow_mut();
         pool.remove(key);
     }
 
     /// Clean up expired connections.
     pub async fn cleanup_expired(&self) {
-        let mut pool = self.pool.write().await;
+        let mut pool = self.pool.borrow_mut();
         pool.retain(|_, conn| !conn.is_expired(self.ttl));
     }
 
     /// Get the number of active connections.
     pub async fn len(&self) -> usize {
-        let pool = self.pool.read().await;
+        let pool = self.pool.borrow();
         pool.len()
     }
 
@@ -98,5 +101,6 @@ where
         self.len().await == 0
     }
 }
+
 
 pub mod manager;

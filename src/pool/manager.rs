@@ -2,28 +2,28 @@ use crate::pool::ConnectionPool;
 use crate::transport::Transport;
 use std::hash::Hash;
 use std::io;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
-use tokio::time::sleep;
+use monoio::time::sleep;
 
 /// A connection manager that handles automatic reconnection with exponential backoff.
 pub struct ConnectionManager<K, T, F>
 where
-    K: Eq + Hash + Clone + Send + Sync + 'static,
+    K: Eq + Hash + Clone + 'static,
     T: Transport,
-    F: Fn(&K) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<T>> + Send>> + Send + Sync,
+    F: Fn(&K) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<T>>>> + 'static,
 {
     pool: ConnectionPool<K, T>,
-    connector: Arc<F>,
+    connector: Rc<F>,
     max_retries: usize,
     base_backoff: Duration,
 }
 
 impl<K, T, F> ConnectionManager<K, T, F>
 where
-    K: Eq + Hash + Clone + Send + Sync + 'static,
+    K: Eq + Hash + Clone + 'static,
     T: Transport,
-    F: Fn(&K) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<T>> + Send>> + Send + Sync,
+    F: Fn(&K) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<T>>>> + 'static,
 {
     pub fn new(
         ttl: Duration,
@@ -33,14 +33,14 @@ where
     ) -> Self {
         Self {
             pool: ConnectionPool::new(ttl),
-            connector: Arc::new(connector),
+            connector: Rc::new(connector),
             max_retries,
             base_backoff,
         }
     }
 
     /// Get or create a connection with automatic retry.
-    pub async fn get_or_connect(&self, key: K) -> io::Result<Arc<T>> {
+    pub async fn get_or_connect(&self, key: K) -> io::Result<Rc<T>> {
         // Try to get from pool first
         if let Some(conn) = self.pool.get(&key).await {
             return Ok(conn);
@@ -86,3 +86,4 @@ where
         self.pool.cleanup_expired().await;
     }
 }
+
